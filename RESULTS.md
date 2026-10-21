@@ -567,3 +567,64 @@ VERDICT julia_110-bin: PASS: after-fix trust follows cacert; before-fix ignores 
   `lib/behave.nix` now also counts `SSL certificate problem` (libcurl's prefix for verification
   failures with OpenSSL-style backends) and `BADCERT_NOT_TRUSTED` (libcurl with mbedTLS) as
   refusals. This changes every cell's derivation, so cached cells run once more.
+
+### rubyPackages.{excon,httpclient,nap,algoliasearch} (fix branch): static FIXED, behavioral PASS for all four
+
+All four fixes are one commit, `6f7ca0cd2` ("rubyPackages.{algoliasearch,excon,httpclient,nap}: use
+cacert bundle instead of vendored CA files"): `postInstall` hooks in `ruby-modules/gem-config` that
+symlink each gem's bundle to cacert's `ca-bundle.crt`. Run on 2026-10-21 from `/` with the local flake,
+one run per attribute:
+`nix run path:. -- rubyPackages.<gem> --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/6f7ca0cd245e2a442b12af32e80709134fb81e21`.
+40 s to 1:20 each. Cleaned outputs: `runs/rubyPackages.<gem>.txt` in the gist.
+
+| gem | vendored file (before) | after | behavioral |
+|---|---|---|---|
+| excon 1.3.1 | `data/cacert.pem`: 148 certs, 23 not in cacert, 12 not for TLS | symlink->cacert:ca-bundle.crt | PASS |
+| httpclient 2.9.0 | `lib/httpclient/cacert.pem`: 153 certs, 98 not in cacert, 19 not for TLS; `cacert1024.pem`: 153 certs, 116 not in cacert | both symlink->cacert:ca-bundle.crt | PASS |
+| nap 1.1.0 | `support/cacert.pem`: 155 certs, 100 not in cacert, 19 not for TLS | symlink->cacert:ca-bundle.crt | PASS |
+| algoliasearch 1.27.5 | `resources/ca-bundle.crt`: 158 certs, 128 not in cacert, 14 not for TLS | symlink->cacert:ca-bundle.crt | PASS |
+
+The matrix is the same for all four:
+
+```
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT rubyPackages.<gem>: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shims: `shims/ruby-gem.nix` (shared) and one `shims/rubyPackages.<gem>.nix` per gem with its
+  request. `ruby -e` runs with the gem and the gems it propagates on `GEM_PATH`. `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` are unset (checked), and OpenSSL's default file
+  (`/etc/ssl/certs/ca-certificates.crt`) does not exist in the sandbox (printed), so only the gem's
+  bundle can make the connection verify.
+  - excon: `Excon.get(url)` with no `ssl_ca_file`. `SSLSocket` adds `Excon::DEFAULT_CA_FILE`
+    (`data/cacert.pem`) to a store with OpenSSL's default paths.
+  - httpclient: `HTTPClient.new.get(url)`. `SSLConfig` lazily loads `lib/httpclient/cacert.pem`.
+  - nap: `REST.get(url, {}, { tls_verify: true })`. nap verifies only with `tls_verify` (or
+    `verify_ssl`); without it, it uses `VERIFY_NONE` and no bundle at all. That was read from
+    `rest/request.rb`, not run. The fix matters only for callers that ask for verification.
+  - algoliasearch: `Algolia::Client.new(application_id:, api_key:, hosts: ["localhost:8443"])`
+    needs no real credentials. The shim takes the HTTPClient session the client builds for that
+    host (`thread_local_hosts`, which calls `ssl_config.add_trust_ca(resources/ca-bundle.crt)`) and
+    does one GET with it. The client's own request methods would then `JSON.parse` the test
+    server's HTML page. `add_trust_ca` also stops httpclient from loading its own `cacert.pem`, so
+    in the after-test cell, where the whole gem set is rebuilt, the CONNECTED comes from
+    algoliasearch's file and not from the httpclient fix.
+- Injection: the fixes take `cacert` in gem-config (`defaultGemConfig`), not in the gem's own
+  function, so the default `.override { cacert }` is a NO-OP for every gem. `ruby-gem.nix` has an
+  `inject` that rebuilds the gem set the way ruby's `passthru.gems` does
+  (`ruby-modules/with-packages`) with `gemConfig = defaultGemConfig.override { cacert = <test cacert>; }`,
+  and takes the same gem. At base gem-config does not take `cacert`, so it is a NO-OP there.
+- Shim logs: the before cells print e.g. `DEFAULT_CA_FILE = .../excon-1.3.1/data/cacert.pem -> .../ruby3.4-excon-1.3.1/.../data/cacert.pem`
+  and end in `SSL_connect returned=1 ... certificate verify failed (unable to get local issuer certificate)`.
+  The after-test cells print `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-bundle.crt` and `status 200`.
+- Found on the way, not part of the fix: `require "algoliasearch"` fails on nixpkgs' Ruby 3.4 with
+  `cannot load such file -- base64 (LoadError)`. `algolia/client.rb` requires `base64`, a bundled
+  (no longer default) gem since Ruby 3.4, and the gem does not declare it. The first run was
+  therefore ERROR in all four cells. The shim adds `rubyPackages.base64` to the gem path
+  (`extraGems = [ "base64" ]`).
+- These runs used the harness as of `58c0701` plus these shims. The other agent's later
+  `lib/behave.nix` change (`79032d1`, more refusal wordings) only widens the REFUSED pattern; every
+  REFUSED cell here already matched the older pattern.

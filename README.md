@@ -45,8 +45,8 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
-`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`; any JVM can reuse
-`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). `--shim NAME` picks another
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`; any JVM can reuse
+`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
 instead of the installed package. Results and logs land in
 `${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
@@ -312,7 +312,7 @@ Sketched, untested shim ideas for other families:
 - **PHP/composer apps**: `php -r` that `require`s the app's
   `vendor/autoload.php` and opens `$URL` with `stream_context_create(['ssl' => ['cafile' =>
   CaBundle::getBundledCaBundlePath()]])`, or with the app's own HTTP helper.
-- **Ruby gems**: `ruby -e` with the gem's client.
+- **Ruby gems**: `ruby -e` with the gem's client. Now done: `shims/ruby-gem.nix` (see "To add a package to the behavioral check").
 - **ncat / curl-like CLIs**: `.sh` shims.
 
 GUI apps, servers and archive-embedded bundles are not practical to drive this way. Use
@@ -334,6 +334,9 @@ To add a package to the behavioral check:
 - **JVM**: `ln -s java-runtime.nix shims/<attr>.nix`.
 - **Python library**: copy `python-lib.nix` and edit the 3-line snippet. Its wheel: copy
   `python-wheel.nix` the same way, and run with `--shim <name>`.
+- **Ruby gem** (gem-config fixes): a `shims/rubyPackages.<gem>.nix` of the form
+  `args: import ./ruby-gem.nix args { require = "..."; code = "..."; }` (see `rubyPackages.excon.nix`);
+  `ruby-gem.nix` injects the test cacert through `defaultGemConfig.override { cacert }`.
 - **CLI**: write `shims/<attr>.sh`.
 
 The output goes to stdout. Per-package working files (scanner JSON, to-build lists, cell
