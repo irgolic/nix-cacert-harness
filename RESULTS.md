@@ -385,3 +385,48 @@ VERDICT python3Packages.raven: PASS: after-fix trust follows cacert; before-fix 
   `status 200`.
 - The fix is a `postInstall` symlink, so the wheel in the `dist` output still carries the vendored
   bundle (the static table above). The httplib2 fix moved to `postPatch` for that reason.
+
+### graalvmPackages.graalvm-ce (fix branch): behavioral PASS; static NOT FIXED (two native-image binaries)
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- graalvmPackages.graalvm-ce --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/3961f527a2230734f10ea70cc22cb8890e7f4cbc`
+(`3961f527a`, "graalvm-ce: generate cacerts from cacert": `buildGraalvm.nix` regenerates
+`lib/security/cacerts` with `jre-generate-cacerts` in `postFixup`). The top-level `graalvm-ce` is a
+throw alias, so the attr is `graalvmPackages.graalvm-ce` (25.4.4.1.1, a binary repackaging; the
+dry-run policy does not treat it as heavy). Both sides were already in the store; the matrix built
+the test-root graalvm-ce once (matrix build 126 s, queue wait and the install check, which runs `native-image` twice, included).
+Cleaned output: `runs/graalvmPackages.graalvm-ce.txt` in the gist.
+
+```
+| out:/lib/libnative-image-agent.so | pem: 0 certs readable; scanner: AAA,ECC G3 | pem: 0 certs readable; scanner: AAA,ECC G3 |
+| out:/lib/security/cacerts | keystore 111 certs: 33 not in cacert, 17 in cacert but not for TLS, 57 cacert TLS roots missing [no-password]; scanner: AAA,ECC G3 | keystore 118 certs == cacert [no-password] |
+| out:/lib/svm/bin/native-image | pem: 0 certs readable; scanner: AAA,ECC G3 | pem: 0 certs readable; scanner: AAA,ECC G3 |
+VERDICT graalvmPackages.graalvm-ce: NOT FIXED: an after-side store is not equivalent to cacert (see table)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT graalvmPackages.graalvm-ce: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim (`shims/graalvmPackages.graalvm-ce.nix`): the `java-runtime` probe with its own `inject`.
+  `graalvm-ce/default.nix` declares only `{ stdenv, fetchurl, graalvmPackages, useMusl }`, so the
+  default injection would be a NO-OP on the after side too. The fix is in the scope's
+  `buildGraalvm.nix`, which takes `...` and forwards unknown arguments into `mkDerivation`, so
+  passing `cacert` to it blindly would change the before-side derivation without wiring anything.
+  The shim instead overrides the package's `graalvmPackages` argument with
+  `graalvmPackages.overrideScope (_: _: { cacert = c; })`, and only when that side's
+  `buildGraalvm.nix` declares `cacert`.
+- Shim logs: the three refusing cells end in `PKIX path building failed`; after-test prints
+  `java.home=.../graalvm-ce-25.4.4.1.1 trustStore=(default)` and `OK status=200`.
+- Static: the keystore itself goes from 111 certs (50 not trusted for TLS by cacert) to exactly
+  cacert's 118. The verdict is NOT FIXED because of two ELF files, `lib/svm/bin/native-image` and
+  `lib/libnative-image-agent.so`. Both are native-image builds that upstream ships; their image heap
+  carries the upstream JDK's root set as DER (the scanner finds 99 known roots, the same count as
+  the before keystore), and they are byte-identical before and after (same sha256). Regenerating
+  `lib/security/cacerts` cannot reach roots compiled into a binary (#576544 class); only rebuilding
+  those images from source would. Neither is the JVM that `bin/java` runs: the behavioral check shows
+  that one follows cacert. Images that users build with the fixed `native-image` take the trust
+  store from `$JAVA_HOME/lib/security/cacerts` at image build time (GraalVM documents this); that was not tested here (a
+  `native-image` compile does not fit the shim's 120 s timeout).
