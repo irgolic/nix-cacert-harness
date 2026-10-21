@@ -88,9 +88,10 @@ tools.runCommand "ca-behave-${lib.replaceStrings [ "." ] [ "-" ] attr}-${variant
     echo "$rc" > $out/rc
     # REFUSED only counts if the failure is a certificate-verification failure; anything else
     # (import error, connection refused, timeout, shim bug) is ERROR so it cannot pass as a
-    # "refusal" in the matrix.
+    # "refusal" in the matrix. libcurl: "SSL certificate problem: ..." (OpenSSL backends), "Cert verify
+    # failed: BADCERT_NOT_TRUSTED" (mbedTLS, e.g. Julia 1.10 Downloads).
     if [ "$rc" = 0 ]; then echo CONNECTED > $out/result
-    elif grep -Eiq 'certificate verify failed|CERTIFICATE_VERIFY_FAILED|unable to get local issuer|PKIX path|unable to find valid certification path|self[- ]signed certificate|unknown ca|certificate (is )?not trusted|untrusted|SSLHandshakeException|server certificate verification failed|x509: certificate signed by unknown authority' $out/shim.log
+    elif grep -Eiq 'certificate verify failed|CERTIFICATE_VERIFY_FAILED|unable to get local issuer|PKIX path|unable to find valid certification path|self[- ]signed certificate|unknown ca|certificate (is )?not trusted|untrusted|SSLHandshakeException|server certificate verification failed|x509: certificate signed by unknown authority|SSL certificate problem|BADCERT_NOT_TRUSTED' $out/shim.log
     then echo REFUSED > $out/result
     else echo ERROR > $out/result; fi
     {

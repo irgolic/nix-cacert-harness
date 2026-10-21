@@ -511,3 +511,59 @@ VERDICT scilab-bin: PASS: after-fix trust follows cacert; before-fix ignores it
   material, not trust stores: jar signature blocks (`META-INF/*.RSA`, `*.DSA`) and the Authenticode /
   macOS signatures of flatlaf's Windows and macOS natives, unchanged before and after.
 
+
+### julia-bin and julia_110-bin (fix branch, install check skipped): static FIXED, behavioral PASS
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- julia-bin --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/05f45e387af5a700548a6dcfc1de4d6e8260eea5 --after-overlay fixes/julia-bin-skip-installcheck.nix`,
+and the same for `julia_110-bin` (`05f45e387`, "julia-bin: use cacert bundle instead of vendored CA
+bundle": `installPhase` symlinks `share/julia/cert.pem` to cacert's `ca-no-trust-rules-bundle.crt`
+in `generic-bin.nix`, which every `julia_1xx-bin` uses). `julia-bin` is `julia_113-bin` (1.13.2);
+`julia_110-bin` (1.10.12, the LTS) was added because its libcurl uses mbedTLS instead of OpenSSL.
+Cleaned outputs: `runs/julia-bin.txt` and `runs/julia_110-bin.txt` in the gist.
+
+**The after side is the fix branch with `doInstallCheck = false`** (`fixes/julia-bin-skip-installcheck.nix`,
+which changes nothing else). The real derivation's install check runs Julia's whole test suite with
+one worker per CPU (nixb's `--cores 4` does not bound it), and the harness would run it twice (the
+static after side and the test-root after cell). The dry-run policy did not stop it: the after side
+is one drv, and `CAH_HEAVY_RE` matches `-julia-<digit>` but not `julia-bin-1.13.2`. Nobody has run
+that test suite on the fix branch (the fix's author skipped the check as well), so these runs say
+nothing about whether it passes. The wiring under test is in `installPhase`; the install check does
+not touch `cert.pem`. Both before sides came from the binary cache; each after side built in about 30 s.
+
+```
+julia-bin:
+| out:/share/julia/cert.pem | pem 121 certs: 3 not in cacert, 0 in cacert but not for TLS, 0 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT julia-bin: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+julia_110-bin:
+| out:/share/julia/cert.pem | pem 144 certs: 19 not in cacert, 12 in cacert but not for TLS, 5 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT julia_110-bin: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+both:
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT julia-bin: PASS: after-fix trust follows cacert; before-fix ignores it
+VERDICT julia_110-bin: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim (`shims/julia-bin.nix`, symlinked as `julia_110-bin.nix`): `julia --startup-file=no -e` with
+  `using Downloads; Downloads.request(url; output = devnull)`. It prints
+  `NetworkOptions.ca_roots_path()` first. That function returns `$JULIA_SSL_CA_ROOTS_PATH`,
+  `$SSL_CERT_FILE` or `$SSL_CERT_DIR` if set, else the first existing Linux system bundle
+  (`/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`, ...), else
+  `Sys.BINDIR/../share/julia/cert.pem` (checked in the shipped `NetworkOptions/src/ca_roots.jl`).
+  The cell has none of the first two, so the bundled file is used; Downloads passes it to libcurl as
+  `CURLOPT_CAINFO`. On NixOS, `/etc/ssl/certs/ca-certificates.crt` exists and wins, so the fix matters
+  where no system bundle exists (build sandboxes, minimal containers, non-NixOS hosts without one).
+- Shim logs: before cells print `ca_roots_path() = .../julia-bin-1.13.2/share/julia/cert.pem -> `
+  the same file (vendored); after cells print `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-no-trust-rules-bundle.crt`
+  (the stock or the test-root cacert). Refusals: 1.13 `RequestError: SSL certificate OpenSSL verify result:
+  unable to get local issuer certificate (20)`, 1.10 `RequestError: Cert verify failed: BADCERT_NOT_TRUSTED`.
+  after-test prints `status 200`.
+- **Harness change**: the first julia_110-bin run classified the three mbedTLS refusals as ERROR
+  (`INCOMPLETE: CONNECTED ERROR ERROR ERROR`), because no pattern matched `BADCERT_NOT_TRUSTED`.
+  `lib/behave.nix` now also counts `SSL certificate problem` (libcurl's prefix for verification
+  failures with OpenSSL-style backends) and `BADCERT_NOT_TRUSTED` (libcurl with mbedTLS) as
+  refusals. This changes every cell's derivation, so cached cells run once more.
