@@ -628,3 +628,63 @@ VERDICT rubyPackages.<gem>: PASS: after-fix trust follows cacert; before-fix ign
 - These runs used the harness as of `58c0701` plus these shims. The other agent's later
   `lib/behave.nix` change (`79032d1`, more refusal wordings) only widens the REFUSED pattern; every
   REFUSED cell here already matched the older pattern.
+
+### invoiceplane (fix branch): static FIXED, behavioral PASS
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- invoiceplane --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/278c921729a83d74a63ea3740cf8392903d9f255`
+(`278c92172`, "invoiceplane: use cacert bundle instead of vendored CA bundles": symlinks of
+`application/config/cacert.pem` and `vendor/stripe/stripe-php/data/ca-certificates.crt` to cacert's
+`ca-no-trust-rules-bundle.crt`). 1:33 in total. Cleaned output: `runs/invoiceplane.txt` in the gist.
+
+```
+| out:/application/config/cacert.pem | pem 136 certs: 111 not in cacert, 14 in cacert but not for TLS, 107 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+| out:/vendor/stripe/stripe-php/data/ca-certificates.crt | pem 135 certs: 31 not in cacert, 18 in cacert but not for TLS, 32 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT invoiceplane: FIXED: before trusted CAs outside cacert; after: 2 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT invoiceplane: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim (`shims/invoiceplane.nix`, modeled on `wordpress.nix`): `php -r` with the package's
+  `vendor/autoload.php`, and one GET through `\Stripe\HttpClient\CurlClient::instance()->request(...)`.
+  InvoicePlane's Stripe gateway uses `StripeClient`, whose requests go through `ApiRequestor` to that
+  client. The client sets `CURLOPT_CAINFO` to `Stripe::getCABundlePath()`, i.e. stripe-php's
+  `data/ca-certificates.crt`, since InvoicePlane never sets one. Going through `ApiRequestor` would
+  then `json_decode` the test server's HTML page.
+- Shim logs: before-test prints `stripe-php 14.10.0 CA bundle .../invoiceplane-1.7.2.1/vendor/stripe/stripe-php/data/ca-certificates.crt`
+  and ends in stripe-php's `ApiConnectionException: Could not verify Stripe's SSL certificate ...
+  (Network error [errno 60]: SSL certificate OpenSSL verify result: unable to get local issuer certificate (20))`.
+  after-test prints `CA bundle .../nss-cacert-3.131.1/etc/ssl/certs/ca-no-trust-rules-bundle.crt` and `status 200`.
+- Only stripe-php's file is exercised. `application/config/cacert.pem` is not read by any PHP code in
+  the package (no reference outside the file itself), so the static table is the only evidence for it.
+
+### moodle (fix branch): static FIXED; no behavioral shim (the vendored files are not read on Linux)
+
+Static only, run on 2026-10-21 from `/` with the local flake:
+`nix run path:.#static -- moodle --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/d9f9e6713ca473d95c644349c4f9fc17d36e4bb6`
+(`d9f9e6713`, "moodle: use cacert bundle instead of vendored CA bundles"). Cleaned output:
+`runs/moodle.txt` in the gist.
+
+```
+| out:/share/moodle/public/lib/cacert.pem | pem 150 certs: 115 not in cacert, 15 in cacert but not for TLS, 98 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+| out:/share/moodle/public/lib/google/src/Google/IO/cacerts.pem | pem 70 certs: 57 not in cacert, 8 in cacert but not for TLS, 113 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT moodle: FIXED: before trusted CAs outside cacert; after: 2 store(s) == cacert, none with extra CAs
+```
+
+No shim, for the same reason as nmap: on Linux nothing in Moodle reads either file, so a behavioral
+test of Moodle's own code path would show the same result before and after.
+- `lib/filelib.php`, `curl::get_cacert()`: `$CFG->dataroot/moodleorgca.crt` if readable, else
+  php.ini `curl.cainfo`, else `$CFG->libdir/cacert.pem` **only when `$CFG->ostype === 'WINDOWS'`**,
+  else `null`, i.e. libcurl's default store. `resetopt()` sets `CURLOPT_CAINFO` only when that is
+  non-null.
+- `lib/google/src/Google/IO/cacerts.pem` is the default `CURLOPT_CAINFO` of the bundled Google API
+  client's `Google_IO_Curl` (and the `cafile` of `Google_IO_Stream`). Moodle's `get_google_client()`
+  (`lib/google/lib.php`) replaces that IO class with `moodle_google_curlio`, which sends requests
+  with Moodle's own `curl` class, so `get_cacert()` above decides.
+- A shim could call `Google_IO_Curl` directly, but that is the vendored library's code, not a path
+  Moodle takes, so it was not written. The fix is still worth having, for Windows-only code and for
+  anything that loads the Google client without Moodle's wrapper. The static check is the evidence.
