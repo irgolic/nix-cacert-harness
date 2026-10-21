@@ -45,7 +45,7 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
-`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`; any JVM can reuse
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`; any JVM can reuse
 `shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
 instead of the installed package. Results and logs land in

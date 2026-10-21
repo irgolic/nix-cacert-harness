@@ -430,3 +430,46 @@ VERDICT graalvmPackages.graalvm-ce: PASS: after-fix trust follows cacert; before
   that one follows cacert. Images that users build with the fixed `native-image` take the trust
   store from `$JAVA_HOME/lib/security/cacerts` at image build time (GraalVM documents this); that was not tested here (a
   `native-image` compile does not fit the shim's 120 s timeout).
+
+### gam (fix branch): static FIXED, behavioral PASS
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- gam --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/1b18fced0d9a5bed56faa2a574f0882060327c48`
+(`1b18fced0`, "gam: use cacert bundle for the vendored fallback CA file": a `postInstall` symlink
+of `gam/cacerts.pem` to cacert's `ca-bundle.crt`). 2:09 in total. Cleaned output: `runs/gam.txt`
+in the gist.
+
+```
+| out:/lib/python3.14/site-packages/gam/cacerts.pem | pem 26 certs: 1 not in cacert, 5 in cacert but not for TLS, 98 cacert TLS roots missing | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT gam: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ bundles inside archives remain, see above)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | yes (rebuilt with cacert + test root)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT gam: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- gam already took `cacert` at base (its wrapper sets `GAM_CA_FILE`), so the before side is rebuilt
+  with the test-root cacert too, not a NO-OP. It still refuses: the vendored fallback does not
+  follow cacert. That is the stronger form of the before-side claim.
+- `GAM_CA_FILE` is read only when gam *creates* `gam.cfg` (it becomes `cacerts_pem` there). An
+  existing `gam.cfg` with an empty `cacerts_pem`, or a run without the wrapper, uses
+  `$GAM_PATH/cacerts.pem`, the file the fix replaces.
+- Shim (`shims/gam.nix`): runs the program the wrapper execs (`bin/.gam-wrapped`, with the
+  program's own `sys.path` setup) under `env -i` (no `GAM_CA_FILE`) with a fresh `GAMCFGDIR`, so
+  the new `gam.cfg` has `cacerts_pem =`. The request is
+  `gam config user_service_account_access_only true user nobody@example.com create drivefile url $URL`:
+  `getMediaBody` fetches the URL with gam's `getHttpObj()` (httplib2, `ca_certs=cacerts_pem`)
+  before any Google credentials are needed. `user_service_account_access_only` skips the Directory
+  API object that resolving `user <u>` builds first. The driver wraps `getMediaBody` to print the
+  CA file and exit 0 after the fetch returns, because the next step contacts Google.
+- Shim logs: before cells print `cacerts_pem = .../gam/cacerts.pem -> .../gam-7.43.04/.../gam/cacerts.pem`
+  and gam's own `ERROR: URL: https://localhost:8443/, [SSL: CERTIFICATE_VERIFY_FAILED] ... unable to get local issuer certificate`;
+  after-test prints `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-bundle.crt` and
+  `fetched https://localhost:8443/ content-type text/html`.
+- Found on the way, not part of the fix: the `bin/gam` wrapper exits 127 on both sides
+  (`line 88: export GAMCFGDIR="${XDG_CONFIG_HOME:-$HOME/.config}/gam": No such file or directory`).
+  The `--run` entries in `makeWrapperArgs` keep their literal single quotes, so each `export`
+  line runs as a command name, and `bash -e` stops there.
+- As for raven, the fix is a `postInstall` symlink, so the `dist` wheel keeps the vendored file.
