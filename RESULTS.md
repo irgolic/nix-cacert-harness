@@ -473,3 +473,41 @@ VERDICT gam: PASS: after-fix trust follows cacert; before-fix ignores it
   The `--run` entries in `makeWrapperArgs` keep their literal single quotes, so each `export`
   line runs as a command name, and `bash -e` stops there.
 - As for raven, the fix is a `postInstall` symlink, so the `dist` wheel keeps the vendored file.
+
+### scilab-bin (fix branch): behavioral PASS; static NOT FIXED (JCEF's libcef.so)
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- scilab-bin --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/89afd381a888d7497fdedc57bbd0815d9b837514`
+(`89afd381a`, "scilab-bin: generate cacerts from cacert": `postFixup` regenerates
+`thirdparty/java/lib/security/cacerts` with `jre-generate-cacerts`, after an explicit
+`autoPatchelf` so that the bundled `keytool` runs). scilab-bin 2027.0.0 is a binary repackaging:
+the dry-run showed one drv per side (the package itself), built in 82 s (before) and 137 s (after);
+the matrix build (the test-root scilab-bin) took 129 s, queue wait included. Cleaned output:
+`runs/scilab-bin.txt` in the gist.
+
+```
+| out:/lib/thirdparty/jcef/libcef.so | pem: 0 certs readable; scanner: AAA,ECC G3 | pem: 0 certs readable; scanner: AAA,ECC G3 |
+| out:/thirdparty/java/lib/security/cacerts | keystore 144 certs: 19 not in cacert, 12 in cacert but not for TLS, 5 cacert TLS roots missing [no-password]; scanner: ECC G3 | keystore 118 certs == cacert [no-password] |
+VERDICT scilab-bin: NOT FIXED: an after-side store is not equivalent to cacert (see table) (+ bundles inside archives remain, see above)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT scilab-bin: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim (`shims/scilab-bin.nix`): the TLS probe on the bundled JRE,
+  `"$PKG/thirdparty/java/bin/java" -cp <probe> TlsProbe "$URL"`. It runs as is: autoPatchelf has set
+  the JRE's RUNPATHs, and the probe needs only `java.base`, so nothing from the launcher scripts'
+  environment is needed. The package declares `cacert`, so the default injection applies.
+- Shim logs: every cell prints `java.home=.../scilab-bin-2027.0.0/thirdparty/java trustStore=(default)`;
+  the three refusing cells end in `PKIX path building failed`, after-test prints `OK status=200`.
+- Static: the bundled JRE's keystore goes from 144 certs (31 not trusted for TLS by cacert) to
+  exactly cacert's 118. The verdict is NOT FIXED because of `lib/thirdparty/jcef/libcef.so`, the
+  Chromium Embedded Framework: the scanner finds 130 known roots compiled into it (Chromium's own
+  root store), and the file is byte-identical before and after (same sha256). Roots compiled into a
+  binary cannot be replaced by packaging (#576544 class). The "inside archives" lines are code-signing
+  material, not trust stores: jar signature blocks (`META-INF/*.RSA`, `*.DSA`) and the Authenticode /
+  macOS signatures of flatlaf's Windows and macOS natives, unchanged before and after.
+
