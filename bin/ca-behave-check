@@ -80,7 +80,7 @@ else
   done
 fi
 
-printf '\n%s  (base %s, after = worktree%s)\n' "$attr" "${base:0:12}" "${overlay:+ + ${overlay##*/}}"
+printf '\n%s  (before %s, after %s%s)\n' "$attr" "$base" "${after:-worktree}" "${overlay:+ + ${overlay##*/}}"
 printf '%-8s | %-12s | %-12s | %s\n' "" "stock cacert" "+ test root" "override with test-root cacert"
 for side in $sides; do
   printf '%-8s | %-12s | %-12s | %s\n' "$side" "${RES[$side-stock]:-}" "${RES[$side-test]:-}" "${INJ[$side-test]:-}"

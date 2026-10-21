@@ -73,15 +73,15 @@
       apps = forAll (pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/ca-check";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/ca-check";
         };
         static = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/ca-static-check";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/ca-static-check";
         };
         behave = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/ca-behave-check";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/ca-behave-check";
         };
       });
 
