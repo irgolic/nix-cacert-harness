@@ -284,6 +284,9 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
   deletion-style fix (nmap, netsurf: the program already used the system store and only the
   stale extra bundle was removed) has nothing to prove behaviorally; the static scan is the evidence.
 - `shims/<attr>.nix`: `{ pkg, pkgs, lib, probes, cacert }: { inputs = [ … ]; script = "…";
+  inject = pkg: cacert: …; }`. `inject` is optional: the default is `pkg.override { cacert = … }` when
+  `cacert` is a declared argument of the package function. Packages that take it through `...`
+  (zulu) need an explicit `inject` (see `shims/zulu.nix`); the harness reports NO-OP otherwise.
   inject = …; /* optional */ }`, for anything that needs an interpreter or wrapper.
   - `shims/python-lib.nix`: `python.withPackages [ pkg ]`, `python3 -I`, one request. It is
     written for httplib2. For another library, copy it and change the 3-line snippet.
