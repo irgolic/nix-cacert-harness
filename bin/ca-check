@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# ca-check ATTR [options]: approach 1 always, approach 2 when shims/ATTR.{nix,sh} exists.
+# Options are passed to both (e.g. --base REV, --after-overlay FILE, --force-build).
+set -uo pipefail
+here=$(dirname "$(readlink -f "$0")")
+attr=$1; shift
+"$here/ca-static-check" "$@" "$attr"
+if [[ -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh ]]; then
+  echo; "$here/ca-behave-check" "$@" "$attr"
+else
+  echo; echo "(no shims/$attr.{nix,sh}: behavioral check skipped)"
+fi

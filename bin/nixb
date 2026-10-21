@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Bounded nix build: at most 3 concurrent builds machine-wide, 4 cores each,
+# low priority. Usage: nixb <nix build args...>   e.g.  nixb -f . temurin-bin -o /path/result
+LOCKDIR=${NIXB_LOCKDIR:-/tmp/nixb-locks}; mkdir -p "$LOCKDIR"
+while true; do
+  for i in 1 2 3; do
+    exec {fd}>"$LOCKDIR/slot$i"
+    if flock -n "$fd"; then
+      exec nice -n 15 ionice -c3 nix build --cores 4 --max-jobs 1 -L --no-link --print-out-paths "$@"
+    fi
+    exec {fd}>&-
+  done
+  sleep 5
+done

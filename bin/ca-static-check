@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# ca-static-check: before/after static comparison of the CA trust stores shipped by a package.
+#
+#   ca-static-check [--base REV] [--after-overlay FILE] [--dry-run-only] [--force-build] ATTR...
+#
+# before = ATTR evaluated at the base commit (default: merge-base HEAD upstream/master),
+#          exported read-only with builtins.fetchGit (no checkout).
+# after  = ATTR evaluated from the worktree $CAH_REPO (optionally + an overlay that simulates
+#          a fix, so the harness can be tried before anyone edits the package).
+# Both sides are dry-run first, built only through the nixb wrapper, and skipped (diff-only)
+# when the dry-run shows a heavy or long build. Every trust store found by nix-cacert-scan
+# (plus every symlink into cacert, plus every Java keystore) is turned into a set of SHA-256
+# fingerprints and compared with the set in cacert's ca-no-trust-rules-bundle.crt.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+base= overlay= dry_only=0 force=0 attrs=()
+while (( $# )); do
+  case $1 in
+    --base) base=$2; shift 2 ;;
+    --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
+    --dry-run-only) dry_only=1; shift ;;
+    --force-build) force=1; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) attrs+=("$1"); shift ;;
+  esac
+done
+(( ${#attrs[@]} )) || die "usage: ca-static-check [--base REV] [--after-overlay FILE] ATTR..."
+
+mkdir -p "$CAH_OUT"
+base=${base:-$(cah_resolve_base)}
+log "base (before) = $base"
+before_src=$(cah_base_src "$base") || die "fetchGit of $base failed"
+mapfile -d '' BEFORE < <(cah_side_args "$before_src")
+mapfile -d '' AFTER < <(cah_side_args "$CAH_REPO" "$overlay")
+
+tools=$(cah_tools "$before_src") || die "could not build harness tools"
+export PATH="$tools/bin:$PATH"
+scanner=$(cah_scanner)
+
+# Reference = what cacert (on the after side) trusts for TLS, and everything it ships at all.
+cacert_paths=$(cah_realise "${AFTER[@]}" 'cacert^out,unbundled' 2>"$CAH_OUT/.cacert.log") || die "cacert build failed"
+cacert_out=$(grep -v -- '-unbundled$' <<<"$cacert_paths" | head -1)
+cacert_unb=$(grep -- '-unbundled$' <<<"$cacert_paths" | head -1)
+ref_dir=$CAH_OUT/.ref/$(basename "$cacert_out")   # cached per cacert store path
+if [[ ! -s $ref_dir/sha256 ]]; then
+  mkdir -p "$ref_dir"
+  pem_fps "$cacert_out/etc/ssl/certs/ca-no-trust-rules-bundle.crt" > "$ref_dir/tls.tsv"
+  cut -f1 "$ref_dir/tls.tsv" | sort -u > "$ref_dir/tls"
+  pem_fps "$cacert_unb"/etc/ssl/certs/*.crt "$cacert_out/etc/ssl/certs/ca-bundle.crt" > "$ref_dir/all.tsv"
+  cut -f1 "$ref_dir/all.tsv" | sort -u > "$ref_dir/all"
+  sha256sum "$cacert_out"/etc/ssl/certs/*.crt | cut -d" " -f1 > "$ref_dir/sha256"
+fi
+log "reference: $(basename "$cacert_out") TLS roots=$(wc -l < "$ref_dir/tls") all=$(wc -l < "$ref_dir/all")"
+
+# describe_store <file> <side-workdir>: sets D_DESC (one line) and D_BAD=1 when the store
+# trusts something that cacert does not trust for TLS. Names of such CAs are appended to
+# <side-workdir>/extra-names.tsv.
+D_BAD=0 D_DESC=
+describe_store() {
+  local p=$1 w=$2 s n tls other extra missing tgt prefix=""
+  D_BAD=0 D_DESC= D_CACERT=0
+  if [[ -L $p ]]; then
+    tgt=$(readlink -f "$p")
+    if [[ $tgt == *-nss-cacert-* ]]; then prefix="symlink->cacert:${tgt##*/} "; else prefix="symlink->${tgt#/nix/store/} "; fi
+    [[ -e $tgt ]] || { D_DESC="${prefix}DANGLING"; D_BAD=1; return; }
+    [[ $tgt == *-nss-cacert-* ]] && D_CACERT=1
+  fi
+  [[ -e $p ]] || { D_DESC="absent"; return; }
+  if (( ! D_CACERT )) && [[ -f $p ]] && grep -qxF "$(sha256sum < "$p" | cut -d' ' -f1)" "$ref_dir/sha256"; then
+    D_CACERT=1 prefix="byte-identical copy of a cacert bundle: "
+  fi
+  s=$(mktemp -p "$w" set.XXXX)
+  cert_set "$p" "$s"
+  n=$(grep -c . "$s")
+  tls=$(comm -12 "$s" "$ref_dir/tls" | grep -c .)
+  extra=$(comm -23 "$s" "$ref_dir/all" | grep -c .)
+  other=$(( n - tls - extra ))
+  missing=$(comm -13 "$s" "$ref_dir/tls" | grep -c .)
+  local note=""; [[ -n $CS_NOTE ]] && note=" [$CS_NOTE]"
+  # The JDK opens lib/security/cacerts *without* a password; a PKCS12 whose cert bags are
+  # password-encrypted therefore has zero trust anchors at runtime, whatever keytool lists.
+  local pwbad=0
+  if [[ $CS_KIND == keystore && $CS_NOTE == needs-password* && ${p##*/} == cacerts ]]; then
+    pwbad=1; note="$note (JVM opens cacerts without a password: 0 trust anchors at runtime!)"
+  fi
+  if (( n == 0 )); then
+    D_DESC="${prefix}${CS_KIND}: 0 certs readable${note}"
+    (( D_CACERT )) || D_BAD=1   # a keystore we cannot read is not proof of anything
+  elif (( extra == 0 && other == 0 && missing == 0 )); then
+    D_DESC="${prefix}${CS_KIND} ${n} certs == cacert${note}"
+  elif (( D_CACERT )); then
+    # ca-bundle.crt also carries non-TLS roots as TRUSTED CERTIFICATE blocks; that is cacert itself
+    D_DESC="${prefix}${CS_KIND} ${n} certs (${tls} TLS roots + ${other} non-TLS, i.e. cacert's own trust-rules bundle)${note}"
+  else
+    (( extra > 0 || other > 0 )) && D_BAD=1
+    D_DESC="${prefix}${CS_KIND} ${n} certs: ${extra} not in cacert, ${other} in cacert but not for TLS, ${missing} cacert TLS roots missing${note}"
+    comm -23 "$s" "$ref_dir/tls" > "$s.x"
+    local x nm
+    while read -r x; do
+      nm=$(awk -F"\t" -v x="$x" '$1==x {print $2; exit}' "$s.tsv")
+      printf "%s\t%s\n" "$x" "${nm:-?}" >> "$w/extra-names.tsv"
+    done < "$s.x"
+  fi
+  (( pwbad )) && D_BAD=1
+  rm -rf "$s" "$s.tsv" "$s.x" "$s.der"
+}
+
+scan_side() {   # <side> <outs.json> <workdir>
+  local side=$1 outs=$2 w=$3 o path
+  : > "$w/findings.tsv"; : > "$w/links.tsv"
+  while IFS=$'\t' read -r o path; do
+    path=$(readlink -f "$path")
+    if [[ -n $scanner ]]; then
+      "$scanner/bin/cacert-scan" --path "$path" 2>>"$w/scan.err" > "$w/scan.$o.jsonl"
+      jq -r --arg o "$o" --arg p "$path" '
+        select((.known_roots|length) >= 20 or (.watch|length) > 0
+               or (.magic // "" | test("^(jks|jceks|pkcs12)$")))
+        | [$o, .file[($p|length):], (.known_roots|length), (.watch|join(",")), (.magic // "-"), .pem_certs]
+        | @tsv' "$w/scan.$o.jsonl" >> "$w/findings.tsv"
+    else
+      # fallback: files with >=20 PEM certs, or keystore magic
+      find "$path" -type f -size -64M -print0 | while IFS= read -r -d '' f; do
+        local c; c=$(grep -ac -- '-----BEGIN .*CERTIFICATE-----' "$f" 2>/dev/null || true)
+        if (( ${c:-0} >= 20 )) || is_keystore "$f"; then
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$o" "${f#"$path"}" "?" "?" "-" "$c" >> "$w/findings.tsv"
+        fi
+      done
+    fi
+    find "$path" -type l -print0 | while IFS= read -r -d '' l; do
+      local t; t=$(readlink -f "$l")
+      [[ $t == *-nss-cacert-* ]] && printf '%s\t%s\t%s\n' "$o" "${l#"$path"}" "$t" >> "$w/links.tsv"
+    done
+  done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$outs")
+}
+
+for attr in "${attrs[@]}"; do
+  W=$CAH_OUT/$attr/static; rm -rf "$W"; mkdir -p "$W"/{before,after}
+  echo "=================================================================="
+  echo "ATTR $attr"
+  echo "before: $CAH_REPO @ ${base:0:12}   after: worktree${overlay:+ + overlay ${overlay##*/}}"
+  declare -A DRV=() STATUS=() OUTS=()
+  for side in before after; do
+    if [[ $side == before ]]; then args=("${BEFORE[@]}"); else args=("${AFTER[@]}"); fi
+    if ! DRV[$side]=$(nix eval --raw "${args[@]}" "$attr.drvPath" 2>"$W/$side/eval.err"); then
+      STATUS[$side]="eval-failed: $(grep -m1 error "$W/$side/eval.err")"; continue
+    fi
+    nix eval --json "${args[@]}" "$attr" --apply \
+      'p: builtins.listToAttrs (map (o: { name = o; value = p.${o}.outPath; }) (p.outputs or [ "out" ]))' \
+      > "$W/$side/outs.json" 2>>"$W/$side/eval.err"
+    cah_dry_run "$W/$side/to-build" "${args[@]}" "$attr^*"
+    pol=$(cah_build_policy "$W/$side/to-build")
+    nb=$(grep -c . "$W/$side/to-build")
+    if (( dry_only )); then STATUS[$side]="dry-run only ($nb drvs to build)"; continue; fi
+    if [[ $pol != ok && $force == 0 ]]; then STATUS[$side]="SKIPPED ${pol#heavy:}"; continue; fi
+    t0=$SECONDS
+    if cah_realise "${args[@]}" "$attr^*" > "$W/$side/outpaths" 2>"$W/$side/build.log"; then
+      STATUS[$side]="ok ($nb built, $((SECONDS - t0))s)"
+      scan_side "$side" "$W/$side/outs.json" "$W/$side"
+    else
+      STATUS[$side]="BUILD FAILED (log: $W/$side/build.log)"
+    fi
+  done
+  same=0; [[ -n ${DRV[before]:-} && ${DRV[before]:-} == "${DRV[after]:-x}" ]] && same=1
+  for side in before after; do
+    printf '%-6s %s\n        drv %s\n' "$side" "${STATUS[$side]}" "${DRV[$side]:-?}"
+  done
+  (( same )) && echo "NOTE: identical derivation on both sides -> no fix in the worktree for $attr"
+
+  # candidates: real-file trust stores and symlinks into cacert, on either side
+  cands=$( { cut -f1,2 "$W"/before/findings.tsv "$W"/after/findings.tsv 2>/dev/null
+             cut -f1,2 "$W"/before/links.tsv "$W"/after/links.tsv 2>/dev/null; } | grep -v '!' | sort -u)
+  archives=$(cat "$W"/before/findings.tsv "$W"/after/findings.tsv 2>/dev/null | grep '!' | cut -f2 | sort -u)
+  bad_before=0 bad_after=0 n_after_ok=0
+  echo
+  printf '%s\n' "| output:path | before | after |" "|---|---|---|"
+  while IFS=$'\t' read -r o rel; do
+    [[ -n $o ]] || continue
+    cells=()
+    for side in before after; do
+      p=$(jq -r --arg o "$o" '.[$o] // empty' "$W/$side/outs.json" 2>/dev/null)
+      if [[ ${STATUS[$side]} != ok* ]]; then cells+=("n/a"); continue; fi
+      [[ -n $p ]] || { cells+=("no such output"); continue; }
+      describe_store "$(readlink -f "$p")$rel" "$W/$side"; d=$D_DESC
+      w=$(awk -F"\t" -v o="$o" -v r="$rel" '$1==o && $2==r {print $4}' "$W/$side/findings.tsv" | head -1 \
+          | tr , "\n" | sed -n "s/^emSign ECC Root CA - G3$/ECC G3/p; s/^AAA Certificate Services$/AAA/p" | paste -sd,)
+      if [[ -n $w && $D_CACERT == 0 ]]; then d="$d; scanner: $w"; D_BAD=1; fi
+      cells+=("$d")
+      if (( D_BAD )); then
+        if [[ $side == before ]]; then bad_before=1; else bad_after=1; fi
+      elif [[ $side == after ]] && (( D_CACERT )) || [[ $side == after && $d == *"== cacert"* ]]; then
+        n_after_ok=$((n_after_ok + 1))
+      fi
+    done
+    printf '| %s:%s | %s | %s |\n' "$o" "$rel" "${cells[0]}" "${cells[1]}"
+  done <<<"$cands"
+  [[ -z $cands ]] && echo "| (no trust stores or cacert links found) | | |"
+  if [[ -n $archives ]]; then
+    echo; echo "inside archives (scanner only, not fixable by a symlink; issue #576542 class):"
+    for side in before after; do
+      awk -F'\t' -v s=$side '$2 ~ /!/ {printf "  %-6s %s:%s  roots=%s %s\n", s, $1, $2, $3, ($4==""?"":"trusts " $4)}' "$W/$side/findings.tsv" 2>/dev/null
+    done
+  fi
+  echo
+  for side in before after; do
+    if [[ ${STATUS[$side]} == ok* ]]; then
+      mapfile -t ps < <(jq -r '.[]' "$W/$side/outs.json")
+      if nix-store -qR "${ps[@]}" 2>/dev/null | grep -q -- '-nss-cacert-'; then c=yes; else c=no; fi
+      echo "cacert in runtime closure ($side): $c"
+    fi
+  done
+  if [[ -s $W/before/extra-names.tsv ]]; then
+    echo "CAs trusted before but not trusted for TLS by cacert ($(cut -f1 "$W/before/extra-names.tsv" | sort -u | wc -l) total), e.g.:"
+    sort -u "$W/before/extra-names.tsv" | cut -f2 | sort -u | awk '/AAA Certificate Services|emSign/ {print; next} {rest[++n]=$0} END {for (i=1;i<=n && i<=6;i++) print rest[i]}' | sed 's/^/  - /'
+  fi
+  # verdict
+  if [[ ${STATUS[before]} != ok* || ${STATUS[after]} != ok* ]]; then
+    verdict="INCOMPLETE (a side was not built)"
+    pos=$(nix eval --raw "${AFTER[@]}" "$attr.meta.position" 2>/dev/null); pos=${pos%:*}
+    if [[ -n $pos && $pos == "$CAH_REPO"/* ]]; then
+      echo "diff-only: git diff ${base:0:12} -- $(dirname "${pos#"$CAH_REPO"/}")"
+      d=$(git -C "$CAH_REPO" diff "$base" -- "$(dirname "${pos#"$CAH_REPO"/}")")
+      if [[ -n $d ]]; then sed 's/^/    /' <<<"$d" | head -80
+      else echo "    (no diff in the package directory: the drv changed through a dependency)"; fi
+    fi
+  elif (( bad_after )); then verdict="NOT FIXED: an after-side store is not equivalent to cacert (see table)"
+  elif (( same && bad_before )); then verdict="NOT FIXED (unchanged): trusts CAs that cacert does not"
+  elif (( bad_before )); then verdict="FIXED: before trusted CAs outside cacert; after: $n_after_ok store(s) == cacert, none with extra CAs"
+  else verdict="NOTHING DETECTED on the before side"
+  fi
+  [[ -n $archives ]] && verdict="$verdict (+ bundles inside archives remain, see above)"
+  echo "VERDICT $attr: $verdict"
+  unset DRV STATUS OUTS
+done

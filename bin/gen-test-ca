@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Generate the throwaway test root + localhost leaf used by the behavioral check.
+# Run once; the files are then fixed inputs (content-addressed) for every run, so the
+# "cacert + test root" derivation is shared and cached across all packages.
+# THE PRIVATE KEYS ARE PUBLIC TEST MATERIAL. Never trust this root outside a test.
+set -euo pipefail
+here=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-$here/fixtures}
+openssl=${OPENSSL:-openssl}
+mkdir -p "$out"; cd "$out"
+[[ -e root.pem ]] && { echo "fixtures already exist in $out (delete to regenerate)" >&2; exit 0; }
+
+cat > root.cnf <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+prompt = no
+[dn]
+CN = nixpkgs cacert-harness TEST ROOT (do not trust)
+O = nixpkgs cacert devendor campaign
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+CNF
+cat > leaf.cnf <<'CNF'
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = localhost
+[v3_leaf]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost, IP:127.0.0.1, IP:::1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+CNF
+# RSA-2048/SHA-256: accepted by everything from JDK 8 / OpenSSL 1.0 to Python 3.13 strict mode.
+"$openssl" req -x509 -new -newkey rsa:2048 -nodes -sha256 -days 7300 \
+  -keyout root.key -out root.pem -config root.cnf
+"$openssl" req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -config leaf.cnf
+"$openssl" x509 -req -in leaf.csr -CA root.pem -CAkey root.key -CAcreateserial \
+  -sha256 -days 3650 -extfile leaf.cnf -extensions v3_leaf -out leaf.pem
+rm -f leaf.csr root.srl
+"$openssl" verify -x509_strict -CAfile root.pem leaf.pem
+"$openssl" x509 -in root.pem -noout -subject -fingerprint -sha256

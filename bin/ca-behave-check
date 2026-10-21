@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ca-behave-check: behavioral proof that a package's TLS trust is wired to cacert.
+#
+#   ca-behave-check [--base REV] [--after-overlay FILE] [--shim FILE] [--sides "before after"]
+#                   [--force-build] [--rerun] ATTR
+#
+# For each side (before = base commit, after = worktree) and each cacert variant
+# (stock, stock + throwaway test root) it builds one sandboxed "cell" derivation
+# (lib/behave.nix) which starts `openssl s_server` on localhost with a leaf signed by the
+# test root and runs the per-package shim (shims/<ATTR>.nix or .sh). Expected matrix:
+#
+#                stock cacert   cacert + test root
+#     before     REFUSED        REFUSED    (trust store frozen / not a function of cacert)
+#     after      REFUSED        CONNECTED  (trust store follows cacert)
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+base= overlay= shim= sides="before after" force=0 salt= attr=
+while (( $# )); do
+  case $1 in
+    --base) base=$2; shift 2 ;;
+    --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
+    --shim) shim=$(readlink -f "$2"); shift 2 ;;
+    --sides) sides=$2; shift 2 ;;
+    --force-build) force=1; shift ;;
+    --rerun) salt=$(date +%s); shift ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    *) attr=$1; shift ;;
+  esac
+done
+[[ -n $attr ]] || die "usage: ca-behave-check [options] ATTR"
+if [[ -z $shim ]]; then
+  for c in "$CAH_HOME/shims/$attr.nix" "$CAH_HOME/shims/$attr.sh"; do [[ -e $c ]] && { shim=$(readlink -f "$c"); break; }; done
+fi
+[[ -n $shim ]] || die "no shim for $attr: write $CAH_HOME/shims/$attr.nix (or .sh), see shims/*.nix"
+
+mkdir -p "$CAH_OUT"
+base=${base:-$(cah_resolve_base)}
+before_src=$(cah_base_src "$base") || die "fetchGit of $base failed"
+[[ -e $CAH_HOME/fixtures/root.pem ]] || die "run bin/gen-test-ca first"
+W=$CAH_OUT/$attr/behave; mkdir -p "$W"
+log "base=$base shim=${shim#"$CAH_HOME"/}"
+
+# Cells whose to-build list contains only these are cheap harness plumbing, not the package.
+own_re='(ca-behave-|nss-cacert-|ca-tls-probe|ca-harness-|-env\.drv$|cacert-extra-certificates|cacert-blocklist|shim\.sh)'
+
+declare -A RES=() INJ=()
+margs=(-f "$CAH_HOME/lib/matrix.nix" --argstr beforeSrc "$before_src" --argstr afterSrc "$CAH_REPO"
+       --argstr overlay "$overlay" --argstr attr "$attr" --argstr shim "$shim"
+       --argstr fixtures "$CAH_HOME/fixtures" --argstr salt "$salt")
+cells=()
+for side in $sides; do for variant in stock test; do cells+=("$side-$variant"); done; done
+rm -f "$W"/*.to-build* "$W"/build.log "$W"/{before,after}-{stock,test}
+cah_dry_run "$W/all.to-build" "${margs[@]}" "${cells[@]}"
+grep -Ev "$own_re" "$W/all.to-build" > "$W/all.to-build.pkg" || true
+log "  package derivations to build for the matrix: $(grep -c . "$W/all.to-build.pkg") $(sed 's|.*/[a-z0-9]\{32\}-||' "$W/all.to-build.pkg" | tr '\n' ' ')"
+pol=$(cah_build_policy "$W/all.to-build.pkg")
+if [[ $pol != ok && $force == 0 ]]; then
+  for cell in "${cells[@]}"; do RES[$cell]="SKIPPED"; done
+  log "  SKIPPED: ${pol#heavy:} (use --force-build, or rely on ca-static-check)"
+else
+  t0=$SECONDS
+  # One queue slot for all cells; --keep-going so one failing package does not hide the rest.
+  cah_realise --keep-going "${margs[@]}" "${cells[@]}" > "$W/outpaths" 2>"$W/build.log" || true
+  log "  matrix build: $((SECONDS - t0))s (incl. waiting for a nixb slot)"
+  for cell in "${cells[@]}"; do
+    if out=$(nix path-info "${margs[@]}" "$cell" 2>/dev/null) && [[ -e $out/result ]]; then
+      RES[$cell]=$(cat "$out/result")
+      INJ[$cell]=$(sed -n 's/^injected=//p' "$out/info")
+      ln -sfn "$out" "$W/$cell"
+      log "  $cell: ${RES[$cell]} -> $out"
+    else
+      RES[$cell]="BUILD-FAILED"; log "  $cell: build failed, see $W/build.log"
+    fi
+  done
+fi
+
+printf '\n%s  (base %s, after = worktree%s)\n' "$attr" "${base:0:12}" "${overlay:+ + ${overlay##*/}}"
+printf '%-8s | %-12s | %-12s | %s\n' "" "stock cacert" "+ test root" "override with test-root cacert"
+for side in $sides; do
+  printf '%-8s | %-12s | %-12s | %s\n' "$side" "${RES[$side-stock]:-}" "${RES[$side-test]:-}" "${INJ[$side-test]:-}"
+done
+for side in $sides; do
+  [[ -e $W/$side-test/control-testroot ]] || continue
+  printf 'control (%s cells): curl --cacert test-root: %s, curl --cacert stock: %s\n' "$side" \
+    "$(cat "$W/$side-test/control-testroot")" "$(cat "$W/$side-test/control-stock")"
+  break
+done
+
+expect() { [[ ${RES[$1]:-} == "$2" ]]; }
+ctrl_ok=0
+[[ $(cat "$W"/*-test/control-testroot 2>/dev/null | sort -u) == CONNECTED && $(cat "$W"/*-test/control-stock 2>/dev/null | sort -u) == REFUSED ]] && ctrl_ok=1
+nskip=0; for c in "${cells[@]}"; do [[ ${RES[$c]} == SKIPPED* ]] && nskip=$((nskip + 1)); done
+if (( nskip == ${#cells[@]} )); then
+  verdict="SKIPPED: the package (or a dependency) needs a heavy rebuild; use ca-static-check (or --force-build)"
+elif (( ! ctrl_ok )); then
+  verdict="INVALID: controls failed (server/test CA broken), see $W/*/control.log"
+elif [[ ${INJ[after-test]:-} == NO-OP* ]] && ! expect after-test CONNECTED; then
+  verdict="INCONCLUSIVE: injecting the test-root cacert was a NO-OP on the after side (the package's function does not take cacert; its trust comes from a dependency, e.g. the JDK it is jlinked from). Add an \`inject\` to the shim, or rely on ca-static-check"
+elif expect after-test CONNECTED && expect after-stock REFUSED && { [[ $sides != *before* ]] || { expect before-test REFUSED && expect before-stock REFUSED; }; }; then
+  verdict="PASS: after-fix trust follows cacert; before-fix ignores it"
+  [[ $sides == *before* ]] || verdict="PASS (after only): trust follows cacert"
+elif expect after-test ERROR && grep -q 'trustAnchors parameter must be non-empty' "$W/after-test/shim.log" 2>/dev/null; then
+  verdict="FAIL: the after-fix JVM sees an EMPTY trust store (password-protected PKCS12 cacerts? see $W/after-test/shim.log)"
+elif expect after-test ERROR; then
+  verdict="FAIL/ERROR: the after-test shim errored without a certificate verdict (shim or package broken?), see $W/after-test/shim.log"
+elif expect after-test REFUSED; then
+  verdict="FAIL: after-fix package does not trust the test root added to cacert (not wired, or shim/injection wrong; see $W/after-test/shim.log)"
+elif expect after-stock CONNECTED; then
+  verdict="FAIL: package trusts the test root even with stock cacert (environment leak?)"
+elif expect before-test CONNECTED; then
+  verdict="NOTE: before already followed cacert (nothing to fix behaviorally?)"
+else
+  verdict="INCOMPLETE: ${RES[*]}"
+fi
+echo "VERDICT $attr: $verdict"
