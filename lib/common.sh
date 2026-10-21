@@ -164,7 +164,14 @@ cah_realise() {
 }
 
 # --- GitHub helpers -------------------------------------------------------------------------
-cah_gh_api() { curl -sfL -H 'Accept: application/vnd.github+json' ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "https://api.github.com/$1"; }
+cah_gh_api() {
+  local r m
+  r=$(curl -sL -H 'Accept: application/vnd.github+json' ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "https://api.github.com/$1") || die "GitHub API request failed: $1"
+  if m=$(jq -er '.message' <<<"$r" 2>/dev/null); then
+    die "GitHub API: $m ($1). Set GITHUB_TOKEN to raise the rate limit, or pass --base/--after explicitly."
+  fi
+  printf '%s' "$r"
+}
 
 # cah_split_ref <REV> -> prints "OWNER/REPO SHA" for github:OWNER/REPO/SHA or a bare hash.
 cah_split_ref() {

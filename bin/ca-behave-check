@@ -37,11 +37,11 @@ fi
 [[ -n $shim ]] || die "no shim for $attr: write $CAH_HOME/shims/$attr.nix (or .sh), see shims/*.nix"
 
 mkdir -p "$CAH_OUT"
-if [[ -n $pr ]]; then read -r base after < <(cah_pr "$pr"); fi
-if [[ -z $base && -n $after ]]; then base=$(cah_parent_of "$after"); fi
-base=${base:-$(cah_resolve_base)}
-before_src=$(cah_base_src "$base") || die "could not fetch base $base"
-after_src=$(cah_after_src "$after") || die "could not fetch after side"
+if [[ -n $pr ]]; then pr_out=$(cah_pr "$pr") || exit 2; read -r base after <<<"$pr_out"; fi
+if [[ -z $base && -n $after ]]; then base=$(cah_parent_of "$after") || exit 2; fi
+if [[ -z $base ]]; then base=$(cah_resolve_base) || exit 2; fi
+before_src=$(cah_base_src "$base") || exit 2
+after_src=$(cah_after_src "$after") || exit 2
 [[ -e $CAH_HOME/fixtures/root.pem ]] || die "run bin/gen-test-ca first"
 W=$CAH_OUT/$attr/behave; mkdir -p "$W"
 log "base=$base shim=${shim#"$CAH_HOME"/}"
