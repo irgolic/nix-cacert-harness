@@ -346,3 +346,42 @@ Harness changes made for this run:
 - **`ca-check`** passed every option to `ca-static-check` too, which took `--shim X` for two
   attribute names. The behavioral-only options (`--shim`, `--sides`, `--rerun`) now go to
   `ca-behave-check` only, and `--shim` runs it even when `shims/<attr>` does not exist.
+
+### python3Packages.raven (fix branch): static FIXED, behavioral PASS
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- python3Packages.raven --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/ce68df1c722b0132567b24298ab000378c45fce3`
+(`ce68df1c7`, "python3Packages.raven: use cacert bundle instead of vendored CA file": a `postInstall`
+symlink of `raven/data/cacert.pem` to cacert's `ca-bundle.crt`). 1:19 in total. Cleaned output:
+`runs/python3Packages.raven.txt` in the gist.
+
+```
+| out:/lib/python3.14/site-packages/raven/data/cacert.pem | pem 155 certs: 94 not in cacert, 19 in cacert but not for TLS, 76 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+inside archives (scanner only; a symlink in the installed output cannot reach them, issue #576542 class):
+  before dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem  roots=107 trusts AAA Certificate Services
+  after  dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem  roots=107 trusts AAA Certificate Services
+VERDICT python3Packages.raven: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ bundles inside archives remain, see above)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT python3Packages.raven: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim (`shims/python3Packages.raven.nix`): an interpreter with raven only, so `certifi` is not
+  importable (checked) and `raven.conf.defaults.CA_BUNDLE` is `raven/data/cacert.pem`. One GET with
+  `raven.transport.http.HTTPTransport(timeout=10).send(url, None, {})`, i.e. the default
+  `sync+https` transport with its default `verify_ssl=True, ca_certs=defaults.CA_BUNDLE`.
+- raven's verified path (`raven.utils.http.urlopen`) calls `ssl.wrap_socket(sock, ca_certs=...,
+  cert_reqs=CERT_REQUIRED)`, which Python removed in 3.12, so on python3.14 it raises
+  `AttributeError` before any TLS happens. The shim restores `ssl.wrap_socket` with the removed
+  function's semantics (verify mode and CA file from the arguments, no hostname check) before
+  importing raven. This is the package's state in nixpkgs, independent of the fix: raven is the
+  unmaintained predecessor of sentry-sdk.
+- Shim logs: before-test prints `CA_BUNDLE = .../raven/data/cacert.pem -> .../python3.14-raven-6.10.0/.../raven/data/cacert.pem`
+  (the vendored file) and ends in `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer
+  certificate`; after-test prints `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-bundle.crt` and
+  `status 200`.
+- The fix is a `postInstall` symlink, so the wheel in the `dist` output still carries the vendored
+  bundle (the static table above). The httplib2 fix moved to `postPatch` for that reason.
