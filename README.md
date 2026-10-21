@@ -27,7 +27,7 @@ There are two tools. They share the same before/after plumbing and need no check
 | proves | set equality of the store file(s) with cacert's TLS roots | trust is *wired* to cacert at runtime |
 | per-package work | none | a shim of 3 to 10 lines (`shims/<attr>.nix` or `.sh`); families can share one |
 | cost | build/fetch both sides, then about 1 to 2 min of scanning | one extra rebuild of the package with a modified cacert, plus about 1 min |
-| status | **tested** (2 packages, a known-good sample, a negative control, the scanner fallback) | **tested** for one Python library, two binary JDKs (temurin, zulu) and wordpress, plus a negative control |
+| status | **tested** (2 packages, a known-good sample, a negative control, the scanner fallback) | **tested** for one Python library (installed package and `dist` wheel), two binary JDKs (temurin, zulu) and wordpress, plus a negative control |
 
 ## For reviewers: one command, no checkout
 
@@ -46,7 +46,9 @@ Both sides are fetched as GitHub archive tarballs into the nix store (PR head co
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
 `temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`; any JVM can reuse
-`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). Results and logs land in
+`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). `--shim NAME` picks another
+shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
+instead of the installed package. Results and logs land in
 `${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
 4 cores each, and a side whose dry-run shows a long from-source build is skipped (diff-only)
 unless `--force-build` is given. `nix` and `git` are taken from your PATH.
@@ -201,8 +203,11 @@ For each side it:
    - `NOTHING DETECTED`
    - `INCOMPLETE` (a side was skipped)
 
-   Bundles found *inside* archives (wheels, jars) are listed separately. A symlink fix
-   cannot reach them; they belong to the #576542 class.
+   Bundles found *inside* archives (wheels, jars) are listed separately, from the scanner's
+   findings. A symlink in the installed output cannot reach them (the #576542 class). A fix that
+   changes the file in the source before the archive is built can, e.g. a `postPatch` symlink
+   (botocore in NixOS/nixpkgs#490115, httplib2). A member whose sha256 equals a cacert bundle is
+   reported as a byte-identical copy of it, like a real file, and is not counted as remaining.
 
 Rules for "bad":
 - A store is bad if it holds any certificate that cacert does not trust for TLS. That
@@ -291,6 +296,12 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
   Use a `.nix` shim for anything that needs an interpreter or wrapper.
   - `shims/python-lib.nix`: `python.withPackages [ pkg ]`, `python3 -I`, one request. It is
     written for httplib2. For another library, copy it and change the 3-line snippet.
+  - `shims/python-wheel.nix` (`--shim python-wheel`): the same request against the wheel in the
+    package's `dist` output. It installs the wheel offline into the sandbox (`pip install
+    --no-index --no-deps --target`), with an interpreter that has pip and the package's Python
+    dependencies but not the package, and checks that the import comes from the wheel. The
+    test variant rebuilds the package, so the wheel is rebuilt with the test-root cacert and the
+    expected matrix is the same as for the installed package.
   - `shims/java-runtime.nix`: `java -cp ${probes.java} TlsProbe $URL`. It works for any
     JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `openjdk`,
     `jre_minimal`. `shims/zulu.nix` runs the same probe with its own `inject`.
@@ -315,13 +326,14 @@ $H/bin/ca-check <attr>          # both: static always, behavioral if shims/<attr
 $H/bin/ca-static-check <attr>   # approach 1 only (any package, several attrs allowed)
 $H/bin/ca-behave-check <attr>   # approach 2 only
 # options: --base REV  --after-overlay fix.nix  --force-build
-#          ca-behave-check only: --shim FILE  --sides after  --rerun
+#          behavioral only: --shim NAME|FILE (NAME = shims/NAME.nix or .sh)  --sides after  --rerun
 # env: CAH_REPO, CAH_OUT (default $H/out), CAH_NIXB, CAH_MAX_BUILDS, CAH_HEAVY_RE, CAH_SCANNER_REF
 ```
 
 To add a package to the behavioral check:
 - **JVM**: `ln -s java-runtime.nix shims/<attr>.nix`.
-- **Python library**: copy `python-lib.nix` and edit the 3-line snippet.
+- **Python library**: copy `python-lib.nix` and edit the 3-line snippet. Its wheel: copy
+  `python-wheel.nix` the same way, and run with `--shim <name>`.
 - **CLI**: write `shims/<attr>.sh`.
 
 The output goes to stdout. Per-package working files (scanner JSON, to-build lists, cell

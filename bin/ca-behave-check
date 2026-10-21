@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ca-behave-check: behavioral proof that a package's TLS trust is wired to cacert.
 #
-#   ca-behave-check [--base REV] [--after REV] [--after-overlay FILE] [--shim FILE] [--sides "before after"]
+#   ca-behave-check [--base REV] [--after REV] [--after-overlay FILE] [--shim NAME|FILE] [--sides "before after"]
 #                   [--force-build] [--rerun] ATTR
 #
 # For each side (before = base commit, after = --after REV or the worktree) and each cacert variant
@@ -15,14 +15,14 @@
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
-pr= base= after= overlay= shim= sides="before after" force=0 salt= attr=
+pr= base= after= overlay= shim= shim_arg= sides="before after" force=0 salt= attr=
 while (( $# )); do
   case $1 in
     --base) base=$2; shift 2 ;;
     --after) after=$2; shift 2 ;;
     --pr) pr=$2; shift 2 ;;
     --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
-    --shim) shim=$(readlink -f "$2"); shift 2 ;;
+    --shim) shim_arg=$2; shift 2 ;;
     --sides) sides=$2; shift 2 ;;
     --force-build) force=1; shift ;;
     --rerun) salt=$(date +%s); shift ;;
@@ -31,10 +31,21 @@ while (( $# )); do
   esac
 done
 [[ -n $attr ]] || die "usage: ca-behave-check [options] ATTR"
+# --shim FILE, or --shim NAME for shims/NAME.nix, shims/NAME.sh or shims/NAME of this harness
+# (so `nix run ... -- ATTR --shim python-wheel` needs no checkout of the harness).
+if [[ -n $shim_arg ]]; then
+  if [[ -f $shim_arg ]]; then shim=$(readlink -f "$shim_arg")
+  else
+    for c in "$CAH_HOME/shims/$shim_arg.nix" "$CAH_HOME/shims/$shim_arg.sh" "$CAH_HOME/shims/$shim_arg"; do
+      [[ -f $c ]] && { shim=$(readlink -f "$c"); break; }
+    done
+  fi
+  [[ -n $shim ]] || die "--shim $shim_arg: not a file, and no shims/$shim_arg.nix, shims/$shim_arg.sh or shims/$shim_arg in $CAH_HOME"
+fi
 if [[ -z $shim ]]; then
   for c in "$CAH_HOME/shims/$attr.nix" "$CAH_HOME/shims/$attr.sh"; do [[ -e $c ]] && { shim=$(readlink -f "$c"); break; }; done
 fi
-[[ -n $shim ]] || die "no shim for $attr: write $CAH_HOME/shims/$attr.nix (or .sh), see shims/*.nix"
+[[ -n $shim ]] || die "no shim for $attr: write $CAH_HOME/shims/$attr.nix (or .sh), see shims/*.nix, or pass --shim NAME|FILE"
 
 mkdir -p "$CAH_OUT"
 if [[ -n $pr ]]; then pr_out=$(cah_pr "$pr") || exit 2; read -r base after <<<"$pr_out"; fi
@@ -43,7 +54,8 @@ if [[ -z $base ]]; then base=$(cah_resolve_base) || exit 2; fi
 before_src=$(cah_base_src "$base") || exit 2
 after_src=$(cah_after_src "$after") || exit 2
 [[ -e $CAH_HOME/fixtures/root.pem ]] || die "run bin/gen-test-ca first"
-W=$CAH_OUT/$attr/behave; mkdir -p "$W"
+# An explicit --shim gets its own working dir, so a run with another shim does not replace its cell links.
+W=$CAH_OUT/$attr/behave${shim_arg:+-$(basename "${shim%.*}")}; mkdir -p "$W"
 log "base=$base shim=${shim#"$CAH_HOME"/}"
 
 # Cells whose to-build list contains only these are cheap harness plumbing, not the package.

@@ -70,6 +70,10 @@ VERDICT python3Packages.httplib2: FIXED: ... (+ bundles inside archives remain, 
 The `dist` wheel output still carries the old bundle. That is expected for this fix and
 belongs to #576542.
 
+(That was the first, `postInstall` version of the fix. The fix branch now makes the symlink in
+`postPatch`, so the wheel gets cacert's bundle too: see "python3Packages.httplib2 (fix branch,
+postPatch)" below.)
+
 ### temurin-jre-bin (Java keystore; fixed in the worktree with jre-generate-cacerts)
 
 ```
@@ -277,3 +281,68 @@ VERDICT zulu: PASS: after-fix trust follows cacert; before-fix ignores it
   unconditional override there was an evaluation error, so the before cells failed to build.
 - "cacert in runtime closure (after): no" is expected: `jre-generate-cacerts` builds the
   keystore from cacert at build time.
+
+### python3Packages.httplib2 (fix branch, postPatch): static FIXED, behavioral PASS with both shims
+
+The fix now makes the symlink in `postPatch`, in the source tree, before the wheel is built, as
+merged NixOS/nixpkgs#490115 does for botocore:
+`ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt httplib2/cacerts.txt`. The build copies the file,
+so the installed `cacerts.txt` and the one in the `dist` wheel are both regular files with the
+content of cacert's `ca-bundle.crt` (sha256 `81ffe987…`, checked with `cmp` and `unzip -p`). The
+package's own tests pass (507 passed). Branch `cacert/python3Packages.httplib2` =
+`e4b7d4ce526cf04c114f650fb2c8143cf2761b8b`.
+
+Run on 2026-10-21 from `/` with the local flake (no GitHub API calls). Cleaned outputs:
+`runs/httplib2.txt` and `runs/httplib2-wheel.txt` in the gist.
+
+```sh
+nix run path:. -- python3Packages.httplib2 --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/e4b7d4ce526cf04c114f650fb2c8143cf2761b8b
+nix run path:. -- python3Packages.httplib2 --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/e4b7d4ce526cf04c114f650fb2c8143cf2761b8b --shim python-wheel
+```
+
+Static (the same for both runs; 1:24 for the first run, 0:50 for the second):
+
+```
+| out:/lib/python3.14/site-packages/httplib2/cacerts.txt | pem 71 certs: 55 not in cacert, 8 in cacert but not for TLS, 110 cacert TLS roots missing; scanner: AAA | byte-identical copy of a cacert bundle: pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+inside archives (scanner only; a symlink in the installed output cannot reach them, issue #576542 class):
+  before dist:/httplib2-0.32.0-py3-none-any.whl!httplib2/cacerts.txt  roots=40 trusts AAA Certificate Services
+  after  dist:/httplib2-0.32.0-py3-none-any.whl!httplib2/cacerts.txt  roots=166, byte-identical copy of cacert:ca-bundle.crt
+cacert in runtime closure (after): no          <- expected: the file is a copy now, not a symlink
+VERDICT python3Packages.httplib2: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ after-side archive copies are byte-identical to cacert)
+```
+
+Behavioral, `shims/python-lib.nix` (installed package) and `shims/python-wheel.nix` (`dist` wheel),
+the same matrix:
+
+```
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT python3Packages.httplib2: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Wheel shim logs: every cell prints `httplib2 0.32.0 from /build/wheel/httplib2/__init__.py` and
+  `CA_CERTS = /build/wheel/httplib2/cacerts.txt`, i.e. the import comes from the pip-installed
+  wheel. The refusals are `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`;
+  after-test prints `status 200`.
+- **Negative control for the wheel shim**: the same shim against the first, `postInstall` version
+  of the fix (`github:irgolic/nixpkgs/9928cfa9993ea47bb4601a8677055134d12bd5b6`), whose wheel kept
+  the vendored file, fails as it should:
+  ```
+  after    | REFUSED      | REFUSED      | yes (rebuilt with cacert + test root)
+  VERDICT python3Packages.httplib2: FAIL: after-fix package does not trust the test root added to cacert (...)
+  ```
+
+Harness changes made for this run:
+- **Archive members**: the scanner's sha256 of each archive member is now kept. A member that is
+  byte-identical to a cacert bundle is printed as such, like a real file, and does not trigger
+  "(+ bundles inside archives remain)". Without this, the after wheel showed
+  `roots=166 trusts AAA Certificate Services,emSign Root CA - G1`: those are cacert's own
+  `ca-bundle.crt` trust-rule blocks (the scanner quirk noted above).
+- **`--shim NAME`** resolves `shims/NAME.nix`, `shims/NAME.sh` or `shims/NAME` of the harness, so it
+  works under `nix run` without a checkout (a file path still works). An explicit `--shim` uses its
+  own working directory, `out/<attr>/behave-<shim>/`.
+- **`ca-check`** passed every option to `ca-static-check` too, which took `--shim X` for two
+  attribute names. The behavioral-only options (`--shim`, `--sides`, `--rerun`) now go to
+  `ca-behave-check` only, and `--shim` runs it even when `shims/<attr>` does not exist.

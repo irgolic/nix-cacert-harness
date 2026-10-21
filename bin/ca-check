@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ca-check ATTR [options]: approach 1 always, approach 2 when shims/ATTR.{nix,sh} exists.
-# Options are passed to both (e.g. --base REV, --after-overlay FILE, --force-build).
+# Options are passed to both (e.g. --base REV, --after-overlay FILE, --force-build), except the
+# behavioral-only --shim NAME|FILE, --sides and --rerun. --shim also runs approach 2 when shims/ATTR does not exist.
 set -uo pipefail
 here=$(dirname "$(readlink -f "$0")")
 if [[ $# -eq 0 || $1 == -h || $1 == --help ]]; then
   cat <<EOF
 usage: ca-check ATTR [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--force-build] [--dry-run-only]
+                     [--shim NAME|FILE] [--sides "before after"] [--rerun]
 
 Reviewing a PR, no checkout needed:
   nix run github:irgolic/nix-cacert-harness -- ATTR --pr N          # NixOS/nixpkgs PR: base and head from GitHub
@@ -14,13 +16,25 @@ Reviewing a PR, no checkout needed:
 Inside a nixpkgs checkout: "before" defaults to the merge-base of HEAD with upstream/master,
 origin/master or master, and "after" to the working tree. Results and logs go to
 \${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness. Builds are bounded (3 at a time, 4 cores each).
+--shim NAME runs the behavioral check with shims/NAME.nix (or .sh) of this harness, e.g.
+--shim python-wheel tests the wheel in the dist output instead of the installed package.
 EOF
   exit 0
 fi
 attr=$1; shift
-"$here/ca-static-check" "$@" "$attr"
-if [[ -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh ]]; then
-  echo; "$here/ca-behave-check" "$@" "$attr"
+# ca-static-check does not know the behavioral-only options (it would take them for attrs).
+common=() behave=() shim=
+while (( $# )); do
+  case $1 in
+    --shim) shim=$2; behave+=("$1" "$2"); shift 2 ;;
+    --sides) behave+=("$1" "$2"); shift 2 ;;
+    --rerun) behave+=("$1"); shift ;;
+    *) common+=("$1"); shift ;;
+  esac
+done
+"$here/ca-static-check" "${common[@]}" "$attr"
+if [[ -n $shim || -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh ]]; then
+  echo; "$here/ca-behave-check" "${common[@]}" "${behave[@]}" "$attr"
 else
   echo; echo "(no shims/$attr.{nix,sh}: behavioral check skipped)"
 fi

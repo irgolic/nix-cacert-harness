@@ -57,6 +57,8 @@ if [[ ! -s $ref_dir/sha256 ]]; then
   sha256sum "$cacert_out"/etc/ssl/certs/*.crt | cut -d" " -f1 > "$ref_dir/sha256"
 fi
 log "reference: $(basename "$cacert_out") TLS roots=$(wc -l < "$ref_dir/tls") all=$(wc -l < "$ref_dir/all")"
+# sha256 -> file name of each cacert bundle, to name byte-identical copies inside archives
+[[ -s $ref_dir/sha256-names ]] || sha256sum "$cacert_out"/etc/ssl/certs/*.crt | sed 's|  .*/|\t|' > "$ref_dir/sha256-names"
 
 # describe_store <file> <side-workdir>: sets D_DESC (one line) and D_BAD=1 when the store
 # trusts something that cacert does not trust for TLS. Names of such CAs are appended to
@@ -121,7 +123,7 @@ scan_side() {   # <side> <outs.json> <workdir>
       jq -r --arg o "$o" --arg p "$path" '
         select((.known_roots|length) >= 20 or (.watch|length) > 0
                or (.magic // "" | test("^(jks|jceks|pkcs12)$")))
-        | [$o, .file[($p|length):], (.known_roots|length), (.watch|join(",")), (.magic // "-"), .pem_certs]
+        | [$o, .file[($p|length):], (.known_roots|length), (.watch|join(",")), (.magic // "-"), .pem_certs, (.sha256 // "-")]
         | @tsv' "$w/scan.$o.jsonl" >> "$w/findings.tsv"
     else
       # fallback: files with >=20 PEM certs, or keystore magic
@@ -200,11 +202,20 @@ for attr in "${attrs[@]}"; do
     printf '| %s:%s | %s | %s |\n' "$o" "$rel" "${cells[0]}" "${cells[1]}"
   done <<<"$cands"
   [[ -z $cands ]] && echo "| (no trust stores or cacert links found) | | |"
+  # Archive members (wheels, jars) are known only from the scanner, which also reports their
+  # sha256. A member that is byte-identical to a cacert bundle is cacert itself (its watch hits,
+  # e.g. AAA in ca-bundle.crt, are cacert's own non-TLS trust-rule blocks), as for real files.
+  arch_after=0 arch_bad_after=0
   if [[ -n $archives ]]; then
-    echo; echo "inside archives (scanner only, not fixable by a symlink; issue #576542 class):"
+    echo; echo "inside archives (scanner only; a symlink in the installed output cannot reach them, issue #576542 class):"
     for side in before after; do
-      awk -F'\t' -v s=$side '$2 ~ /!/ {printf "  %-6s %s:%s  roots=%s %s\n", s, $1, $2, $3, ($4==""?"":"trusts " $4)}' "$W/$side/findings.tsv" 2>/dev/null
+      awk -F'\t' -v s=$side 'NR==FNR {name[$1]=$2; next}
+        $2 ~ /!/ { if ($7 in name) printf "  %-6s %s:%s  roots=%s, byte-identical copy of cacert:%s\n", s, $1, $2, $3, name[$7]
+                   else printf "  %-6s %s:%s  roots=%s %s\n", s, $1, $2, $3, ($4==""?"":"trusts " $4) }' \
+        "$ref_dir/sha256-names" "$W/$side/findings.tsv" 2>/dev/null
     done
+    read -r arch_after arch_bad_after < <(awk -F'\t' 'NR==FNR {c[$1]; next} $2 ~ /!/ {n++; if (!($7 in c)) b++} END {print n+0, b+0}' \
+      "$ref_dir/sha256-names" "$W/after/findings.tsv" 2>/dev/null || echo "0 0")
   fi
   echo
   for side in before after; do
@@ -233,7 +244,8 @@ for attr in "${attrs[@]}"; do
   elif (( bad_before )); then verdict="FIXED: before trusted CAs outside cacert; after: $n_after_ok store(s) == cacert, none with extra CAs"
   else verdict="NOTHING DETECTED on the before side"
   fi
-  [[ -n $archives ]] && verdict="$verdict (+ bundles inside archives remain, see above)"
+  if (( arch_bad_after )); then verdict="$verdict (+ bundles inside archives remain, see above)"
+  elif (( arch_after )); then verdict="$verdict (+ after-side archive copies are byte-identical to cacert)"; fi
   echo "VERDICT $attr: $verdict"
   unset DRV STATUS OUTS
 done
