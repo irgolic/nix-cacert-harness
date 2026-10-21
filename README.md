@@ -53,6 +53,57 @@ unless `--force-build` is given. `nix` and `git` are taken from your PATH.
 Inside a nixpkgs checkout the arguments are optional: "before" is the merge-base of HEAD with
 `upstream/master`, `origin/master` or `master`, and "after" is the working tree.
 
+### Example: the merged wordpress fix, NixOS/nixpkgs#576572
+
+```console
+$ nix run github:irgolic/nix-cacert-harness -- wordpress --pr 576572
+PR #576572: wordpress_*: use cacert bundle instead of vendored bundle  base=808311374c3a head=d305233a9b6e
+reference: fprs4zi8r6227x12qbsd1grvfrpz6201-nss-cacert-3.131.1 TLS roots=118 all=169
+==================================================================
+ATTR wordpress
+before: github:NixOS/nixpkgs/808311374c3ab66fdf82ffff5e8bfc9e5d327786   after: github:NixOS/nixpkgs/d305233a9b6e1acc118fc94772db64a83e61cdac
+before ok (0 built, 0s)
+        drv /nix/store/l058nd6s2xddzwxp43d2pyccarlwf51l-wordpress-7.1.3.drv
+after  ok (0 built, 0s)
+        drv /nix/store/k9si7khhxfkl3vjl6ndlk484w88r52dv-wordpress-7.1.3.drv
+| output:path | before | after |
+|---|---|---|
+| out:/share/wordpress/wp-includes/certificates/ca-bundle.crt | pem 119 certs: 4 not in cacert, 1 in cacert but not for TLS, 4 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+cacert in runtime closure (before): no
+cacert in runtime closure (after): yes
+CAs trusted before but not trusted for TLS by cacert (5 total), e.g.:
+  - C=IN, OU=emSign PKI, O=eMudhra Technologies Limited, CN=emSign ECC Root CA - G3
+  - C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign ECC Root CA - C3
+  - C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign Root CA - C1
+  - CN=Atos TrustedRoot 2011, O=Atos, C=DE
+  - C=TW, O=Chunghwa Telecom Co., Ltd., OU=ePKI Root Certification Authority
+VERDICT wordpress: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+base=github:NixOS/nixpkgs/808311374c3ab66fdf82ffff5e8bfc9e5d327786 shim=shims/wordpress.nix
+  package derivations to build for the matrix: 3 php-extra-init-8.5.11.ini.drv php-with-extensions-8.5.11.drv wordpress-7.1.3.drv
+  matrix build: 15s (incl. waiting for a nixb slot)
+  before-stock: REFUSED -> /nix/store/c5q60innznwa6v0p6ai2l4h7w1sysz3g-ca-behave-wordpress-stock
+  before-test: REFUSED -> /nix/store/9vhqwzg1ja68vpshdahk2w1lkczrvfjm-ca-behave-wordpress-test
+  after-stock: REFUSED -> /nix/store/6lp65wx0a7mmjsp6wmyzqwbs9fnbb4bk-ca-behave-wordpress-stock
+  after-test: CONNECTED -> /nix/store/1zhj54jyckjrvj9k9fyi1w83cxiq7y63-ca-behave-wordpress-test
+wordpress  (before github:NixOS/nixpkgs/808311374c3a…, after github:NixOS/nixpkgs/d305233a9b6e…)
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT wordpress: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+78 seconds on a warm machine (two nixpkgs tarballs fetched, wordpress and a php built). Reading it:
+
+- **Static table**: the vendored bundle before (119 certs, 4 of them roots cacert does not trust,
+  including emSign ECC Root CA - G3) versus a symlink into cacert after, equal to cacert's 118 roots.
+- **Behavioral matrix**: before the fix, adding a root to cacert changes nothing (the bundle is
+  frozen). After, the program connects exactly when the root is in cacert.
+- **Controls**: `curl` with the test root connects and `curl` with stock cacert refuses, so the
+  server was up and the refusals are certificate errors, not networking failures.
+- Each cell is a store path you can inspect: `shim.log` has the program's own output.
+
 ## Layout
 
 ```
