@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ca-static-check: before/after static comparison of the CA trust stores shipped by a package.
 #
-#   ca-static-check [--base REV] [--after-overlay FILE] [--dry-run-only] [--force-build] ATTR...
+#   ca-static-check [--base REV] [--after REV] [--after-overlay FILE] [--dry-run-only] [--force-build] ATTR...
 #
 # before = ATTR evaluated at the base commit (default: merge-base HEAD upstream/master),
 #          exported read-only with builtins.fetchGit (no checkout).
-# after  = ATTR evaluated from the worktree $CAH_REPO (optionally + an overlay that simulates
+# after  = ATTR evaluated from --after REV, or the worktree $CAH_REPO (optionally + an overlay that simulates
 #          a fix, so the harness can be tried before anyone edits the package).
 # Both sides are dry-run first, built only through the nixb wrapper, and skipped (diff-only)
 # when the dry-run shows a heavy or long build. Every trust store found by nix-cacert-scan
@@ -14,10 +14,12 @@
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
-base= overlay= dry_only=0 force=0 attrs=()
+pr= base= after= overlay= dry_only=0 force=0 attrs=()
 while (( $# )); do
   case $1 in
     --base) base=$2; shift 2 ;;
+    --after) after=$2; shift 2 ;;
+    --pr) pr=$2; shift 2 ;;
     --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
     --dry-run-only) dry_only=1; shift ;;
     --force-build) force=1; shift ;;
@@ -25,14 +27,17 @@ while (( $# )); do
     *) attrs+=("$1"); shift ;;
   esac
 done
-(( ${#attrs[@]} )) || die "usage: ca-static-check [--base REV] [--after-overlay FILE] ATTR..."
+(( ${#attrs[@]} )) || die "usage: ca-static-check [--base REV] [--after REV] [--after-overlay FILE] ATTR..."
 
 mkdir -p "$CAH_OUT"
+if [[ -n $pr ]]; then read -r base after < <(cah_pr "$pr"); fi
+if [[ -z $base && -n $after ]]; then base=$(cah_parent_of "$after"); fi
 base=${base:-$(cah_resolve_base)}
 log "base (before) = $base"
-before_src=$(cah_base_src "$base") || die "fetchGit of $base failed"
+before_src=$(cah_base_src "$base") || die "could not fetch base $base"
+after_src=$(cah_after_src "$after") || die "could not fetch after side"
 mapfile -d '' BEFORE < <(cah_side_args "$before_src")
-mapfile -d '' AFTER < <(cah_side_args "$CAH_REPO" "$overlay")
+mapfile -d '' AFTER < <(cah_side_args "$after_src" "$overlay")
 
 tools=$(cah_tools "$before_src") || die "could not build harness tools"
 export PATH="$tools/bin:$PATH"
@@ -138,7 +143,7 @@ for attr in "${attrs[@]}"; do
   W=$CAH_OUT/$attr/static; rm -rf "$W"; mkdir -p "$W"/{before,after}
   echo "=================================================================="
   echo "ATTR $attr"
-  echo "before: $CAH_REPO @ ${base:0:12}   after: worktree${overlay:+ + overlay ${overlay##*/}}"
+  echo "before: ${base}   after: ${after:-worktree $CAH_REPO}${overlay:+ + overlay ${overlay##*/}}"
   declare -A DRV=() STATUS=() OUTS=()
   for side in before after; do
     if [[ $side == before ]]; then args=("${BEFORE[@]}"); else args=("${AFTER[@]}"); fi
@@ -217,7 +222,7 @@ for attr in "${attrs[@]}"; do
   if [[ ${STATUS[before]} != ok* || ${STATUS[after]} != ok* ]]; then
     verdict="INCOMPLETE (a side was not built)"
     pos=$(nix eval --raw "${AFTER[@]}" "$attr.meta.position" 2>/dev/null); pos=${pos%:*}
-    if [[ -n $pos && $pos == "$CAH_REPO"/* ]]; then
+    if [[ -z $after && -n $pos && $pos == "$CAH_REPO"/* ]]; then
       echo "diff-only: git diff ${base:0:12} -- $(dirname "${pos#"$CAH_REPO"/}")"
       d=$(git -C "$CAH_REPO" diff "$base" -- "$(dirname "${pos#"$CAH_REPO"/}")")
       if [[ -n $d ]]; then sed 's/^/    /' <<<"$d" | head -80

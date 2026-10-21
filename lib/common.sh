@@ -6,7 +6,7 @@
 CAH_HOME=${CAH_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 CAH_REPO=${CAH_REPO:-$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
 CAH_NIXB=${CAH_NIXB:-$CAH_HOME/bin/nixb}
-CAH_OUT=${CAH_OUT:-$CAH_HOME/out}
+CAH_OUT=${CAH_OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/nix-cacert-harness}
 # Pinned so results are reproducible; override with CAH_SCANNER_REF=github:zimbatm/nix-cacert-scan
 CAH_SCANNER_REF=${CAH_SCANNER_REF:-github:zimbatm/nix-cacert-scan/3bae26b1140e29ed0f6e6f64021567cc3c85804d}
 # Max number of derivations a side may need to *build* before we refuse (diff-only).
@@ -19,17 +19,46 @@ die() { log "error: $*"; exit 2; }
 
 # --- base revision -------------------------------------------------------------------
 cah_resolve_base() {
-  local b
-  if b=$(git -C "$CAH_REPO" merge-base HEAD upstream/master 2>/dev/null); then echo "$b"; return; fi
-  if b=$(git -C "$CAH_REPO" rev-parse --verify -q cacert-devendor 2>/dev/null); then echo "$b"; return; fi
-  die "cannot determine base: no upstream/master and no cacert-devendor branch (pass --base REV)"
+  local b r
+  cah_have_repo || die "not inside a nixpkgs checkout: pass --base REV (the before-fix commit)"
+  for r in upstream/master origin/master master; do
+    if b=$(git -C "$CAH_REPO" merge-base HEAD "$r" 2>/dev/null) && [[ $b != $(git -C "$CAH_REPO" rev-parse HEAD) ]]; then echo "$b"; return; fi
+  done
+  die "cannot determine the before-fix base: HEAD has no merge-base with upstream/master, origin/master or master that differs from HEAD (pass --base REV)"
 }
 
-# Export <rev> of the local repo into the store (cached by nix after the first ~100 s).
-cah_base_src() {
-  local rev=$1
-  nix eval --raw --impure --expr \
-    "(builtins.fetchGit { url = \"$CAH_REPO\"; rev = \"$rev\"; shallow = true; }).outPath"
+# Is $CAH_REPO a nixpkgs git checkout?
+cah_have_repo() { [[ -e $CAH_REPO/pkgs/top-level/all-packages.nix ]] && git -C "$CAH_REPO" rev-parse --verify -q HEAD >/dev/null 2>&1; }
+
+# cah_src_for <REV>: a nixpkgs source tree in the store for one side.
+#   github:OWNER/REPO/REV   -> GitHub archive tarball of that commit
+#   a commit in $CAH_REPO   -> read-only export of the local repo (fetchGit, no checkout)
+#   a bare commit hash      -> GitHub archive from ${CAH_GITHUB_REPO:-NixOS/nixpkgs}
+# (PR head commits are reachable through the base repo's archive URL once the PR exists.)
+cah_src_for() {
+  local rev=$1 url
+  if [[ $rev == github:*/*/* ]]; then
+    rev=${rev#github:}; url="https://github.com/${rev%/*}/archive/${rev##*/}.tar.gz"
+  elif cah_have_repo && git -C "$CAH_REPO" rev-parse --verify -q "$rev^{commit}" >/dev/null 2>&1; then
+    rev=$(git -C "$CAH_REPO" rev-parse "$rev^{commit}")
+    nix eval --raw --impure --expr \
+      "(builtins.fetchGit { url = \"$CAH_REPO\"; rev = \"$rev\"; shallow = true; }).outPath"
+    return
+  elif [[ $rev =~ ^[0-9a-f]{7,40}$ ]]; then
+    url="https://github.com/${CAH_GITHUB_REPO:-NixOS/nixpkgs}/archive/$rev.tar.gz"
+  else
+    die "cannot resolve revision '$rev': not a commit in $CAH_REPO, not a hash, not github:OWNER/REPO/REV"
+  fi
+  log "fetching $url"
+  nix eval --raw --impure --expr "(builtins.fetchTarball \"$url\")"
+}
+cah_base_src() { cah_src_for "$1"; }
+
+# cah_after_src [REV]: the after side. Default is the local worktree.
+cah_after_src() {
+  if [[ -n ${1:-} ]]; then cah_src_for "$1"; return; fi
+  cah_have_repo || die "not inside a nixpkgs checkout: pass --after REV (and --base REV), or set CAH_REPO"
+  echo "$CAH_REPO"
 }
 
 # --- nix arg vectors for a side ----------------------------------------------------------
@@ -132,4 +161,35 @@ cah_realise() {
   local p
   if p=$(nix path-info "$@" 2>/dev/null) && [[ -n $p ]]; then echo "$p"; return 0; fi
   "$CAH_NIXB" "$@"
+}
+
+# --- GitHub helpers -------------------------------------------------------------------------
+cah_gh_api() { curl -sfL -H 'Accept: application/vnd.github+json' ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "https://api.github.com/$1"; }
+
+# cah_split_ref <REV> -> prints "OWNER/REPO SHA" for github:OWNER/REPO/SHA or a bare hash.
+cah_split_ref() {
+  local rev=$1
+  if [[ $rev == github:*/*/* ]]; then rev=${rev#github:}; echo "${rev%/*} ${rev##*/}"
+  elif [[ $rev =~ ^[0-9a-f]{7,40}$ ]]; then echo "${CAH_GITHUB_REPO:-NixOS/nixpkgs} $rev"
+  else return 1; fi
+}
+
+# cah_parent_of <REV>: first parent of a GitHub commit, as github:OWNER/REPO/SHA.
+cah_parent_of() {
+  local repo sha p
+  read -r repo sha < <(cah_split_ref "$1") || die "--after must be github:OWNER/REPO/REV or a commit hash to infer --base"
+  p=$(cah_gh_api "repos/$repo/commits/$sha" | jq -r '.parents[0].sha // empty') || true
+  [[ -n $p ]] || die "could not get the parent of $sha from GitHub ($repo); pass --base REV"
+  echo "github:$repo/$p"
+}
+
+# cah_pr <N> [OWNER/REPO]: prints "github:REPO/BASE_SHA github:REPO/HEAD_SHA" for a pull request.
+# Head commits of a fork PR are served through the base repository's archive URLs.
+cah_pr() {
+  local n=$1 repo=${2:-${CAH_GITHUB_REPO:-NixOS/nixpkgs}} j b h
+  j=$(cah_gh_api "repos/$repo/pulls/$n") || die "could not read PR #$n of $repo from GitHub"
+  b=$(jq -r '.base.sha // empty' <<<"$j"); h=$(jq -r '.head.sha // empty' <<<"$j")
+  [[ -n $b && -n $h ]] || die "PR #$n: missing base/head sha"
+  log "PR #$n: $(jq -r .title <<<"$j")  base=${b:0:12} head=${h:0:12}"
+  echo "github:$repo/$b github:$repo/$h"
 }

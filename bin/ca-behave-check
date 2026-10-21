@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ca-behave-check: behavioral proof that a package's TLS trust is wired to cacert.
 #
-#   ca-behave-check [--base REV] [--after-overlay FILE] [--shim FILE] [--sides "before after"]
+#   ca-behave-check [--base REV] [--after REV] [--after-overlay FILE] [--shim FILE] [--sides "before after"]
 #                   [--force-build] [--rerun] ATTR
 #
-# For each side (before = base commit, after = worktree) and each cacert variant
+# For each side (before = base commit, after = --after REV or the worktree) and each cacert variant
 # (stock, stock + throwaway test root) it builds one sandboxed "cell" derivation
 # (lib/behave.nix) which starts `openssl s_server` on localhost with a leaf signed by the
 # test root and runs the per-package shim (shims/<ATTR>.nix or .sh). Expected matrix:
@@ -15,10 +15,12 @@
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
-base= overlay= shim= sides="before after" force=0 salt= attr=
+pr= base= after= overlay= shim= sides="before after" force=0 salt= attr=
 while (( $# )); do
   case $1 in
     --base) base=$2; shift 2 ;;
+    --after) after=$2; shift 2 ;;
+    --pr) pr=$2; shift 2 ;;
     --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
     --shim) shim=$(readlink -f "$2"); shift 2 ;;
     --sides) sides=$2; shift 2 ;;
@@ -35,8 +37,11 @@ fi
 [[ -n $shim ]] || die "no shim for $attr: write $CAH_HOME/shims/$attr.nix (or .sh), see shims/*.nix"
 
 mkdir -p "$CAH_OUT"
+if [[ -n $pr ]]; then read -r base after < <(cah_pr "$pr"); fi
+if [[ -z $base && -n $after ]]; then base=$(cah_parent_of "$after"); fi
 base=${base:-$(cah_resolve_base)}
-before_src=$(cah_base_src "$base") || die "fetchGit of $base failed"
+before_src=$(cah_base_src "$base") || die "could not fetch base $base"
+after_src=$(cah_after_src "$after") || die "could not fetch after side"
 [[ -e $CAH_HOME/fixtures/root.pem ]] || die "run bin/gen-test-ca first"
 W=$CAH_OUT/$attr/behave; mkdir -p "$W"
 log "base=$base shim=${shim#"$CAH_HOME"/}"
@@ -45,7 +50,7 @@ log "base=$base shim=${shim#"$CAH_HOME"/}"
 own_re='(ca-behave-|nss-cacert-|ca-tls-probe|ca-harness-|-env\.drv$|cacert-extra-certificates|cacert-blocklist|shim\.sh)'
 
 declare -A RES=() INJ=()
-margs=(-f "$CAH_HOME/lib/matrix.nix" --argstr beforeSrc "$before_src" --argstr afterSrc "$CAH_REPO"
+margs=(-f "$CAH_HOME/lib/matrix.nix" --argstr beforeSrc "$before_src" --argstr afterSrc "$after_src"
        --argstr overlay "$overlay" --argstr attr "$attr" --argstr shim "$shim"
        --argstr fixtures "$CAH_HOME/fixtures" --argstr salt "$salt")
 cells=()

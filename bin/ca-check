@@ -3,6 +3,20 @@
 # Options are passed to both (e.g. --base REV, --after-overlay FILE, --force-build).
 set -uo pipefail
 here=$(dirname "$(readlink -f "$0")")
+if [[ $# -eq 0 || $1 == -h || $1 == --help ]]; then
+  cat <<EOF
+usage: ca-check ATTR [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--force-build] [--dry-run-only]
+
+Reviewing a PR, no checkout needed:
+  nix run github:irgolic/nix-cacert-harness -- ATTR --pr N          # NixOS/nixpkgs PR: base and head from GitHub
+  nix run github:irgolic/nix-cacert-harness -- ATTR --after REV     # REV = sha or github:OWNER/REPO/sha; base = its parent
+  nix run github:irgolic/nix-cacert-harness -- ATTR --base REV --after REV
+Inside a nixpkgs checkout: "before" defaults to the merge-base of HEAD with upstream/master,
+origin/master or master, and "after" to the working tree. Results and logs go to
+\${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness. Builds are bounded (3 at a time, 4 cores each).
+EOF
+  exit 0
+fi
 attr=$1; shift
 "$here/ca-static-check" "$@" "$attr"
 if [[ -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh ]]; then

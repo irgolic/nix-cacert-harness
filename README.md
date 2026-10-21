@@ -28,10 +28,35 @@ the tooling itself is disclosed here and open for review. The static check wraps
 plumbing, the behavioral test and the negative control are this repository's own.
 RESULTS.md records what was actually run.
 
+## For reviewers: one command, no checkout
+
+```sh
+# a NixOS/nixpkgs pull request: base and head commits are read from GitHub
+nix run github:irgolic/nix-cacert-harness -- <attr> --pr <N>
+
+# a commit (PR head, or github:OWNER/REPO/SHA for a fork); "before" is its parent
+nix run github:irgolic/nix-cacert-harness -- <attr> --after <sha>
+
+# explicit before/after
+nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
+```
+
+Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
+fork are served through the base repository's archive URL). The static check always runs; the
+behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`,
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`; any JVM can reuse
+`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). Results and logs land in
+`${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
+4 cores each, and a side whose dry-run shows a long from-source build is skipped (diff-only)
+unless `--force-build` is given. `nix` and `git` are taken from your PATH.
+
+Inside a nixpkgs checkout the arguments are optional: "before" is the merge-base of HEAD with
+`upstream/master`, `origin/master` or `master`, and "after" is the working tree.
+
 ## Layout
 
 ```
-bin/ca-check             one command per package: static, then behavioral if a shim exists
+bin/ca-check             one command per package: static, then behavioral if a shim exists (--pr/--after/--base)
 bin/ca-static-check      approach 1 (before/after table of trust stores vs cacert)
 bin/ca-behave-check      approach 2 (2x2 behavioral matrix in the nix sandbox)
 bin/gen-test-ca          one-time generation of the throwaway test root + localhost leaf
