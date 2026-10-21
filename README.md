@@ -16,7 +16,7 @@ There are two tools. They share the same before/after plumbing and need no check
 | proves | set equality of the store file(s) with cacert's TLS roots | trust is *wired* to cacert at runtime |
 | per-package work | none | a shim of 3 to 10 lines (`shims/<attr>.nix` or `.sh`); families can share one |
 | cost | build/fetch both sides, then about 1 to 2 min of scanning | one extra rebuild of the package with a modified cacert, plus about 1 min |
-| status | **tested** (2 packages, a known-good sample, a negative control, the scanner fallback) | **tested** for one Python library and one binary JDK, plus a negative control |
+| status | **tested** (2 packages, a known-good sample, a negative control, the scanner fallback) | **tested** for one Python library, two binary JDKs (temurin, zulu) and wordpress, plus a negative control |
 
 ## Provenance and AI disclosure
 
@@ -287,12 +287,12 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
   inject = pkg: cacert: …; }`. `inject` is optional: the default is `pkg.override { cacert = … }` when
   `cacert` is a declared argument of the package function. Packages that take it through `...`
   (zulu) need an explicit `inject` (see `shims/zulu.nix`); the harness reports NO-OP otherwise.
-  inject = …; /* optional */ }`, for anything that needs an interpreter or wrapper.
+  Use a `.nix` shim for anything that needs an interpreter or wrapper.
   - `shims/python-lib.nix`: `python.withPackages [ pkg ]`, `python3 -I`, one request. It is
     written for httplib2. For another library, copy it and change the 3-line snippet.
   - `shims/java-runtime.nix`: `java -cp ${probes.java} TlsProbe $URL`. It works for any
-    JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `zulu`, `openjdk`,
-    `jre_minimal`.
+    JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `openjdk`,
+    `jre_minimal`. `shims/zulu.nix` runs the same probe with its own `inject`.
   - For apps that bundle a jlink'd runtime, use `"$PKG/<runtime>/bin/java"` in the same line.
     The probe only needs `java.base`.
 

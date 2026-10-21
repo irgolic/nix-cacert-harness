@@ -215,7 +215,6 @@ time) and drops the `JAVA_TOOL_OPTIONS` lines, so keytool writes a password-encr
   example (`shims/example-cli.sh`) is untested.
 - Not exercised:
   - `--sides after`;
-  - a custom `inject` in a shim;
   - an `--after-overlay` that *adds* a fix. Only the negative-control overlay was run.
 - A global-overlay injection (`cacert = cacertTest` everywhere) was deliberately not done,
   because of the cost of the cascade.
@@ -246,3 +245,35 @@ The shim (`shims/wordpress.nix`) does what `class-wp-http.php` does: `Requests::
 ### nmap, PR #576568 (merged): static only by design
 
 The fix removes a bundle that ncat merged with the system store; nothing in the package reads cacert at a build-time path, so there is no wiring for the behavioral test to prove. The former `shims/example-cli.sh` (ncat, untested) was removed for that reason.
+
+## Campaign fix branches (via `--base`/`--after`, no checkout)
+
+### zulu (fix branch): static FIXED, behavioral PASS, 2:13 total
+
+Run on 2026-10-21 from `/` with the local flake (no GitHub API calls):
+`nix run path:. -- zulu --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/f428226b7bb9e1c857b5a36c85e4adf7d35f8829`
+(`f428226b7`, "zulu: generate cacerts from cacert"). `zulu` is `zulu21`, i.e. `zulu-ca-jdk-21.0.11`.
+
+```
+| out:/lib/security/cacerts | keystore 109 certs: 33 not in cacert, 17 in cacert but not for TLS, 59 cacert TLS roots missing [no-password]; scanner: AAA,ECC G3 | keystore 118 certs == cacert [no-password] |
+VERDICT zulu: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+  package derivations to build for the matrix: 1 zulu-ca-jdk-21.0.11.drv
+  matrix build: 73s (incl. waiting for a nixb slot)
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT zulu: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Shim logs: both before cells and after-stock end in
+  `SSLHandshakeException: (certificate_unknown) PKIX path building failed`. After-test runs on
+  the zulu rebuilt with the test-root cacert and prints `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
+- This is the first run of a shim with a custom `inject` (`shims/zulu.nix`). zulu's version
+  files declare only `{ callPackage, enableJavaFX, ... }` and forward the rest to `common.nix`,
+  so the default `functionArgs ? cacert` test finds nothing. The shim overrides `cacert` only
+  when that side's `common.nix` takes it. The base's does not, so before-test is a NO-OP. An
+  unconditional override there was an evaluation error, so the before cells failed to build.
+- "cacert in runtime closure (after): no" is expected: `jre-generate-cacerts` builds the
+  keystore from cacert at build time.
