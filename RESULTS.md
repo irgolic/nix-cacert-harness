@@ -221,3 +221,28 @@ time) and drops the `JAVA_TOOL_OPTIONS` lines, so keytool writes a password-encr
   because of the cost of the cascade.
 - Only the two worked examples, the known-good sample and the negative control were run. The
   other ~60 campaign packages were not.
+
+## Validation against independently merged PRs (via `--pr`, no checkout)
+
+Run on 2026-10-21 with `nix run path:. -- <attr> --pr <N>` from `/`, both sides fetched from
+GitHub by the PR's base and head commits.
+
+### wordpress, PR #576572 (merged, by bartoostveen): static FIXED, behavioral PASS, 1:18 total
+
+```
+| out:/share/wordpress/wp-includes/certificates/ca-bundle.crt | pem 119 certs: 4 not in cacert, 1 in cacert but not for TLS, 4 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT wordpress: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+VERDICT wordpress: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+The shim (`shims/wordpress.nix`) does what `class-wp-http.php` does: `Requests::set_certificate_path(ABSPATH.WPINC.'/certificates/ca-bundle.crt')`, then one GET with the shipped Requests library under `php`.
+
+### osquery, PR #576516 (merged): `--pr` resolution checked with `--dry-run-only` (both sides evaluated; osquery is a long build, not run)
+
+### nmap, PR #576568 (merged): static only by design
+
+The fix removes a bundle that ncat merged with the system store; nothing in the package reads cacert at a build-time path, so there is no wiring for the behavioral test to prove. The former `shims/example-cli.sh` (ncat, untested) was removed for that reason.

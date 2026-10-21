@@ -43,7 +43,7 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
-behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`,
+behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
 `temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`; any JVM can reuse
 `shims/java-runtime.nix`, any Python library `shims/python-lib.nix`). Results and logs land in
 `${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
@@ -229,8 +229,9 @@ A shim makes the program do one HTTPS GET of `$URL`. Its exit code is 0 only if 
 came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$PKG`
 (package under test) and `$CACERT` (the cacert of this cell) are available.
 
-- `shims/<attr>.sh`: a plain shell snippet with `$PKG/bin` on PATH. Good for CLIs, e.g.
-  `shims/example-cli.sh` (ncat; untested).
+- `shims/<attr>.sh`: a plain shell snippet with `$PKG/bin` on PATH, for CLIs. Note that a
+  deletion-style fix (nmap, netsurf: the program already used the system store and only the
+  stale extra bundle was removed) has nothing to prove behaviorally; the static scan is the evidence.
 - `shims/<attr>.nix`: `{ pkg, pkgs, lib, probes, cacert }: { inputs = [ … ]; script = "…";
   inject = …; /* optional */ }`, for anything that needs an interpreter or wrapper.
   - `shims/python-lib.nix`: `python.withPackages [ pkg ]`, `python3 -I`, one request. It is
