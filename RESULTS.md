@@ -511,7 +511,6 @@ VERDICT scilab-bin: PASS: after-fix trust follows cacert; before-fix ignores it
   material, not trust stores: jar signature blocks (`META-INF/*.RSA`, `*.DSA`) and the Authenticode /
   macOS signatures of flatlaf's Windows and macOS natives, unchanged before and after.
 
-
 ### julia-bin and julia_110-bin (fix branch, install check skipped): static FIXED, behavioral PASS
 
 Run on 2026-10-21 from `/` with the local flake:
@@ -688,3 +687,45 @@ test of Moodle's own code path would show the same result before and after.
 - A shim could call `Google_IO_Curl` directly, but that is the vendored library's code, not a path
   Moodle takes, so it was not written. The fix is still worth having, for Windows-only code and for
   anything that loads the Google client without Moodle's wrapper. The static check is the evidence.
+
+### h2o (fix branch): static FIXED, behavioral PASS
+
+Run on 2026-10-21 from `/` with the local flake:
+`nix run path:. -- h2o --base github:irgolic/nixpkgs/8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/9695aa7d969197154a8f2e1745bd4bd0303af275`
+(`9695aa7d9`, "h2o: use cacert bundle instead of vendored CA bundle": a `postInstall` symlink of
+`share/h2o/ca-bundle.crt` to cacert's `ca-bundle.crt`). Both sides were built from source, one drv
+each (296 s before, 221 s after); the matrix's first build of the test-root h2o took 212 s, queue
+wait included. Cleaned output: `runs/h2o.txt` in the gist.
+
+```
+| out:/share/h2o/ca-bundle.crt | pem 129 certs: 46 not in cacert, 18 in cacert but not for TLS, 53 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT h2o: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT h2o: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What reads the file (checked in the source at the package's rev `cee2cca6`): `src/httpclient.c`
+  (`bin/h2o-httpclient`, installed by `INSTALL(TARGETS h2o-httpclient ...)`) loads
+  `$H2O_ROOT/share/h2o/ca-bundle.crt`. `H2O_ROOT` is an environment override (unset in the cell)
+  or the compiled-in `-DH2O_ROOT=${CMAKE_INSTALL_PREFIX}`; the built binary contains the `out`
+  path. Verification is on unless `-k` is given (`SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`,
+  plus a hostname check after the handshake). A failed chain ends the request with
+  `h2o-httpclient: <X509_verify_cert_error_string>`, before any response.
+- Shim (`shims/h2o.nix`): `timeout 10 h2o-httpclient --io-timeout 2000 -o /dev/null "$URL"`. Success
+  is the `HTTP/1 200` status line, not the exit code. The harness's `openssl s_server -www` answers
+  HTTP/1.0 without Content-Length and ends with a TLS close_notify, and h2o-httpclient does not take
+  that as the end of the body. After a verified 200 it exits 1 with `I/O timeout`; in about 1 run in 6
+  it hangs past its own `--io-timeout` instead (reproduced outside the sandbox with the same server:
+  the status line arrives, the server has sent close_notify, and the client never returns).
+  `-m HEAD`, `-H 'connection: close'` and `-2 0` do not change this. The first two runs of the
+  matrix show both cases: after-test was ERROR once with `HTTP/1 200 ok` followed by `I/O timeout`,
+  and once on the 120 s cell timeout; the second version also lacked `grep` on the shim's PATH.
+- Shim logs: the three refusing cells print `ca-bundle.crt -> .../h2o-2.3.0-rolling-2026-10-21/share/h2o/ca-bundle.crt`
+  (before, vendored) or `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-bundle.crt` (after-stock), then
+  `h2o-httpclient: unable to get local issuer certificate`. after-test prints the test-root cacert's
+  path, `HTTP/1 200 ok`, `h2o-httpclient: I/O timeout` and `status 200 received after the verified handshake`.
+
