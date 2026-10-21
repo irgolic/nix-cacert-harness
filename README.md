@@ -1,5 +1,16 @@
 # nix-cacert-harness
 
+> [!WARNING]
+> **AI Disclosure**: This whole repository (scripts, Nix expressions, shims, README and RESULTS)
+> was generated with Claude Code, a mix of Claude Fable 5.1 and Claude Opus 5.5 (Opus wrote the
+> scripts, Fable orchestrated and packaged them), and has only been lightly reviewed by a human.
+> It exists to verify AI-assisted nixpkgs changes under the
+> [nixpkgs AI policy](https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md#automationai-policy),
+> so read its own output with that in mind: it is published so it can be reviewed, and RESULTS.md
+> records what was actually run. The static check wraps
+> [zimbatm/nix-cacert-scan](https://github.com/zimbatm/nix-cacert-scan); the before/after plumbing,
+> the behavioral test and the negative control are this repository's own.
+
 Per-package evidence for the campaign in NixOS/nixpkgs#576475 (#576541 PEM bundles,
 #576543 Java keystores). For one attribute it shows that:
 
@@ -17,16 +28,6 @@ There are two tools. They share the same before/after plumbing and need no check
 | per-package work | none | a shim of 3 to 10 lines (`shims/<attr>.nix` or `.sh`); families can share one |
 | cost | build/fetch both sides, then about 1 to 2 min of scanning | one extra rebuild of the package with a modified cacert, plus about 1 min |
 | status | **tested** (2 packages, a known-good sample, a negative control, the scanner fallback) | **tested** for one Python library, two binary JDKs (temurin, zulu) and wordpress, plus a negative control |
-
-## Provenance and AI disclosure
-
-This harness was written with Claude Code (Claude Opus 5.5 wrote the scripts, Claude Fable 5.1
-orchestrated and packaged them) and reviewed by a human before publication. It exists to verify
-AI-assisted nixpkgs changes, so per the [nixpkgs AI policy](https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md#ai-policy)
-the tooling itself is disclosed here and open for review. The static check wraps
-[zimbatm/nix-cacert-scan](https://github.com/zimbatm/nix-cacert-scan); the before/after
-plumbing, the behavioral test and the negative control are this repository's own.
-RESULTS.md records what was actually run.
 
 ## For reviewers: one command, no checkout
 
