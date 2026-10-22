@@ -1561,3 +1561,63 @@ flyspray's `scripts/oauth.php` gets it), run by hand with nixpkgs' PHP 8.5.12 ag
 output, prints `Guzzle\Service\Client CURLOPT_CAINFO .../Guzzle/Http/Resources/cacert.pem` and then
 `Uncaught Guzzle\Common\Exception\InvalidArgumentException: Invalid handle provided`. nixpkgs has no
 PHP older than 8.2, so there is no TLS behavior to test: all four cells would be ERROR.
+
+### Round 2, Python apps and libraries, and the `certified` gem (worktree): static FIXED, behavioral PASS for all six
+
+Six fixes in the `cacert-devendor` worktree, not yet committed when run (2026-10-22). Python ones
+use `postFixup`, the gem a gem-config `postInstall`, all the same two lines: `rm <file>`, then
+`ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt <file>`. Run from `/` with the local flake against
+the live worktree, one run per attribute (3 in parallel):
+`CAH_REPO=/home/rafael/nixpkgs nix run path:. -- <attr> --base 8915027df75d0403ef013dd0cbf09ff3c602fd03`.
+54 s to 3:23 each. Cleaned outputs: `runs/<attr>.txt` in the gist.
+
+| attr | vendored file (before) | after | behavioral | time |
+|---|---|---|---|---|
+| bazarr 1.6.2 | `lib/bazarr/libs/certifi/cacert.pem`: 118 certs, 3 not in cacert, 1 not for TLS (emSign) | symlink->cacert:ca-bundle.crt | PASS | 3:23 |
+| tautulli 2.18.2 | `libexec/tautulli/lib/certifi/cacert.pem`: 121 certs, 3 not in cacert (emSign) | symlink->cacert:ca-bundle.crt | PASS | 2:14 |
+| headphones 0.6.4 | `opt/headphones/lib/certifi/cacert.pem`: 131 certs, 40 not in cacert, 17 not for TLS (AAA, emSign) | symlink->cacert:ca-bundle.crt | PASS | 0:57 |
+| python3Packages.stripe 15.5.1 | `stripe/data/ca-certificates.crt`: 144 certs, 19 not in cacert, 12 not for TLS | symlink->cacert:ca-bundle.crt | PASS | 2:47 |
+| python3Packages.aliyun-python-sdk-core 2.16.0 | `aliyunsdkcore/vendored/requests/packages/certifi/cacert.pem`: 132 certs, 61 not in cacert, 18 not for TLS (AAA) | symlink->cacert:ca-bundle.crt | PASS | 1:36 |
+| rubyPackages.certified 1.0.0 | `certs/ca-bundle.crt`: 153 certs, 116 not in cacert, 16 not for TLS (AAA) | symlink->cacert:ca-bundle.crt | PASS | 0:54 |
+
+The matrix is the same for all six:
+
+```
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT <attr>: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Injection is the default `.override { cacert }` for the five Python ones (they now take `cacert`),
+  and `ruby-gem.nix`'s gem-config injection for `certified`.
+- The three apps (`shims/bazarr.nix`, `shims/tautulli.nix`, `shims/headphones.nix`) ship their own
+  `requests` and `certifi` in a lib dir that the program puts first on `sys.path`. Each shim runs the
+  interpreter the package itself execs (bazarr: the `exec` line of `bin/bazarr`; tautulli: the shebang
+  of `.Tautulli.py-wrapped`; headphones: the shebang of `Headphones.py`) with `-I` and the same
+  `sys.path` setup, and prints `requests.__file__` and `certifi.where()` so the log shows the vendored
+  copies were used. bazarr imports its own `app.libs` (which does the `sys.path` inserts) and calls
+  `requests.get` with the default `verify`. tautulli goes through `plexpy.http_handler.HTTPHandler`
+  (`verify=certifi.where()`, used for all Plex requests); it logs request errors instead of raising,
+  so the shim sends its logger to stdout. headphones calls `requests.get(verify=True)`, which is what
+  `headphones.request.request_response` does with the default `VERIFY_SSL_CERT` (the function itself
+  needs an initialised config).
+- `shims/python3Packages.stripe.nix`: `stripe.Balance.retrieve()` with `api_base = $URL`, a dummy key,
+  no retries and the default HTTP client (`RequestsClient`, `verify=stripe.ca_bundle_path`). The test
+  server's HTML reply ends in an `APIError` that carries `http_status` 200; that is counted as
+  connected, any other exception is not. Refusals are stripe's `APIConnectionError: Could not verify
+  Stripe's SSL certificate ... CERTIFICATE_VERIFY_FAILED`.
+- `shims/python3Packages.aliyun-python-sdk-core.nix`: one GET through
+  `aliyunsdkcore.http.http_response.HttpResponse` (what `AcsClient` uses) with the default verify,
+  i.e. the vendored requests' `DEFAULT_CA_BUNDLE_PATH`. The vendored urllib3 is old enough to warn
+  `SNIMissingWarning` on Python 3.14; the handshake still verifies.
+- `shims/rubyPackages.certified.nix` (`ruby-gem.nix`): `require "certified"`, then
+  `Net::HTTP.get_response(URI(url))`; certified's `use_ssl=` sets `ca_file` to `certs/ca-bundle.crt`.
+- Static: stripe's and aliyun's `dist` wheels still carry the old bundles (listed under "inside
+  archives"; #576542 class, not addressed by these fixes). The remaining scanner findings in bazarr
+  and tautulli are `future/backports/test/*.pem` fixtures.
+- Not run: cudatext (same batch). Its `share/cudatext/py` is only a source for a first-start copy
+  into `~/.config/cudatext`, and that copy reads the hard-coded `/usr/share/cudatext/py` (seen in the
+  binary and at runtime: "Cannot find data: ~/.config/cudatext/py"), so the store's
+  `py/sys/certifi/cacert.pem` is never on the embedded Python's `sys.path`. Nothing to test.
