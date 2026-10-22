@@ -820,6 +820,75 @@ The matrix and verdict are the same as in "python3Packages.httplib2 (fix branch,
 prints `httplib2 0.32.0 from /build/wheel/httplib2/__init__.py`, `CA_CERTS = /build/wheel/httplib2/cacerts.txt`
 and `status 200`. The other three cells end in `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`.
 
+### blink-qt (fix branch, postPatch): after side FIXED; before unbuildable, so the verdict is INCOMPLETE
+
+`--after 6676921ad0d35eadb0d7bbc4110d6e07a1a6f94b` (`cacert/blink-qt`, "blink-qt: use cacert bundle
+instead of vendored CA bundle": a `postPatch` symlink of `resources/tls/ca.crt` to cacert's
+`ca-no-trust-rules-bundle.crt`). Run on 2026-10-22 from `/` against the local checkout, cleaned
+output `runs/blink-qt.txt` in the gist:
+
+```sh
+CAH_REPO=/home/rafael/nixpkgs nix run path:. -- blink-qt --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after 6676921ad0d35eadb0d7bbc4110d6e07a1a6f94b --after-overlay fixes/unbreak-msrplib.nix --force-build
+```
+
+blink-qt does not build on the base, independently of the fix. Three of its Python dependencies fail:
+- `python3Packages.msrplib` and `python3Packages.xcaplib` fail in `pythonMetadataCheckPhase` with
+  `No package metadata was found for msrplib` (`xcaplib`). Upstream's project names are
+  `python3-msrplib` and `python3-xcaplib` (the wheels are `python3_msrplib-0.21.2` and
+  `python3_xcaplib-2.0.2`), but the pnames are `msrplib` and `xcaplib`.
+- `python3Packages.python3-sipsimple` fails to compile its Cython 3.3.0 output: `_core.c` calls
+  `__pyx_tp_new_vectorcall_..._BaseHeader` (and `BaseContactHeader`, `BaseContentTypeHeader`,
+  `IdentityHeader`, ...) without a declaration, which GCC rejects (`-Wimplicit-function-declaration`,
+  `-Wint-conversion`). It builds with `cython_3_2` (3.2.5), as preshed and levenshtein already do.
+
+`fixes/unbreak-msrplib.nix` works around all three, for the after side only (that is how
+`--after-overlay` works): pname `python3-msrplib` and `python3-xcaplib` through `overrideAttrs`, and
+`python3-sipsimple.override { cython = cython_3_2; }`. It uses `pythonPackagesExtensions`, because
+blink-qt takes the top-level `python3Packages`, which is `python314Packages` (`python314.pkgs`), so a
+`python3 = prev.python3.override { packageOverrides = ...; }` overlay would not reach it. The dry run
+showed 4 drvs: the three dependencies (787 s through `nixb`, nearly all of it sipsimple and its bundled pjsip) and
+blink-qt (73 s).
+
+```
+before BUILD FAILED (log: ~/.cache/nix-cacert-harness/blink-qt/static/before/build.log)
+after  ok (1 built, 73s)
+| out:/share/blink/tls/ca.crt | n/a | byte-identical copy of a cacert bundle: pem 118 certs == cacert |
+  after  dist:/blink-6.0.6-cp314-cp314-linux_x86_64.whl!blink-6.0.6.data/data/share/blink/tls/ca.crt  roots=115, byte-identical copy of cacert:ca-no-trust-rules-bundle.crt
+cacert in runtime closure (after): yes
+VERDICT blink-qt: INCOMPLETE (a side was not built) (+ after-side archive copies are byte-identical to cacert)
+```
+
+The installed file is a copy, not a symlink: setuptools' `data_files` copies the symlink's target,
+and so does the wheel. `roots=115` is the scanner's count of roots it knows; the member is
+byte-identical to cacert's 118-root file.
+
+Independent check with `bin/nixb`: `lib/nixpkgs.nix` plus the overlay on both commits, so that there
+is a "before" to compare with (a blink-qt-only rebuild, 39 s).
+
+| file | sha256 | PEM blocks | CN=AG Projects Development |
+|---|---|---|---|
+| cacert `ca-no-trust-rules-bundle.crt` | `8fd949630c20b946465122a53e33982d24f673ddf8b93776a39c7ba00b6a4d6a` | 118 | 0 |
+| upstream source `resources/tls/ca.crt` | `0553831db87f4ef6dfa2362e09d9fe4f1ae4eb6d6949596fa5322a2da61dd251` | 135 | 1 |
+| before: `out` `share/blink/tls/ca.crt` | `0553831d…` (= upstream) | 135 | 1 |
+| before: `dist` wheel `*/share/blink/tls/ca.crt` | `0553831d…` (= upstream) | 135 | 1 |
+| after: `out` `share/blink/tls/ca.crt` | `8fd94963…` (= cacert) | 118 | 0 |
+| after: `dist` wheel `*/share/blink/tls/ca.crt` | `8fd94963…` (= cacert) | 118 | 0 |
+
+By SHA-256 fingerprint, the before bundle has 135 certificates: 53 not in cacert, 18 in cacert but not
+for TLS (e.g. AAA Certificate Services, DigiCert Global Root CA, GlobalSign Root CA), 64 of cacert's TLS
+roots; 54 of cacert's 118 TLS roots are missing. One of the 53 is AG Projects' private development CA
+(`C=NL, ST=Noord-Holland, L=Haarlem, O=AG Projects, OU=Development, CN=AG Projects Development`), first in
+the file. Others are cross-signed or superseded versions of current roots (ISRG Root X1 cross-signed by
+DST Root CA X3, the 2016 GTS Root R1 to R4) and Let's Encrypt intermediates (R3, R10, R11, E5, E6).
+These counts were computed by hand with `openssl x509 -fingerprint`, because the harness only describes
+sides it built.
+
+What reads the file: blink's `TLSSettingsExtension.ca_list` defaults to `Resources.get('tls/ca.crt')`,
+i.e. `share/blink/tls/ca.crt`. python3-sipsimple passes it to pjsip as the SIP-over-TLS `ca_file`, and
+loads it into the account's GnuTLS `X509Credentials`, which MSRP over TLS uses. No behavioral shim: the
+before side cannot be built without the overlay, and the TLS consumers are a SIP stack and GnuTLS
+sessions, not a single HTTPS call.
+
 
 ## Java fixes that bundle or build a JRE (run against local fix branches)
 
