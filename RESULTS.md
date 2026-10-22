@@ -1430,3 +1430,134 @@ VERDICT corretto21: PASS: after-fix trust follows cacert; before-fix ignores it
   the refusing cells end in `PKIX path building failed`, after-test prints
   `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
 - "cacert in runtime closure: no" on both sides is expected: the keystore is generated at build time.
+
+## PHP apps with vendored bundles, round 2 (worktree as the after side)
+
+Run on 2026-10-22 from inside the nixpkgs checkout, so the after side is the live worktree of the
+local fix branch (`CAH_REPO=/home/rafael/nixpkgs`) and the before side is its base:
+`nix run path:<harness> -- <attr> --base 8915027df75d0403ef013dd0cbf09ff3c602fd03`.
+None of these apps is built with `php.buildComposerProject2`, or the bundle is not composer/ca-bundle's,
+so the builder fix (NixOS/nixpkgs#576561) does not reach them. Each fix is `rm` + `ln -s` of the file to
+cacert's `ca-no-trust-rules-bundle.crt` in `installPhase`/`postInstall`. Cleaned outputs: `runs/matomo.txt`,
+`runs/monica.txt`, `runs/n98-magerun2.txt`, `runs/phpPackages.castor.txt` in the gist.
+
+About composer/ca-bundle in the sandbox: `CaBundle::getSystemCaRootBundlePath()` looks at
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `openssl.cafile`/`openssl.capath`, OpenSSL's default cert file and a list
+of distribution paths before it falls back to its own `res/cacert.pem`. The cell scrubs the environment
+and has no `/etc/ssl`, so that lookup always ends at the vendored file: the realistic case of a host or
+container without a system store. With a system store the vendored file is not read through that call.
+`CaBundle::getBundledCaBundlePath()` returns the vendored file unconditionally.
+
+### matomo: static FIXED, behavioral PASS
+
+76 s in total (matrix 31 s). The fix also adds the file to `filesToFix`, so `config/manifest.inc.php` gets
+the symlink target's size and sha256 and the admin "file integrity" check stays clean.
+
+```
+| out:/share/vendor/composer/ca-bundle/res/cacert.pem | pem 119 certs: 4 not in cacert, 1 in cacert but not for TLS, 4 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT matomo: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT matomo: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What reads the file: `Piwik\Http::configCurlCertificate()` (`core/Http.php`) sets `CURLOPT_CAINFO` on
+  every curl request Matomo makes to `custom_cacert_pem` (empty in `config/global.ini.php`) or else
+  `CaBundle::getBundledCaBundlePath()`, with no system-store lookup. The vendored
+  maxmind/web-service-common uses `getSystemCaRootBundlePath()`.
+- Shim (`shims/matomo.nix`): `php -r` with `share/vendor/autoload.php`, a curl handle with
+  `CURLOPT_CAINFO = getBundledCaBundlePath()`, one GET. Matomo's Config (needed to read
+  `custom_cacert_pem`) is not bootstrapped.
+- Shim logs: `composer/ca-bundle 1.5.13`; before cells point both lookups at
+  `.../matomo-5.13.0/share/vendor/composer/ca-bundle/res/cacert.pem` and end in
+  `curl error 60: SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)`;
+  after-stock points at `.../nss-cacert-3.131.1/etc/ssl/certs/ca-no-trust-rules-bundle.crt` and refuses the same
+  way; after-test points at the test-root cacert's bundle and prints `status 200`.
+
+### monica: static FIXED, behavioral PASS (both files)
+
+90 s in total, run concurrently with n98-magerun2 (matrix 43 s).
+
+```
+| out:/vendor/composer/ca-bundle/res/cacert.pem | pem 147 certs: 26 not in cacert, 18 in cacert but not for TLS, 15 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+| out:/vendor/stripe/stripe-php/data/ca-certificates.crt | pem 135 certs: 31 not in cacert, 18 in cacert but not for TLS, 32 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT monica: FIXED: before trusted CAs outside cacert; after: 2 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT monica: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What reads the files: stripe-php 9.9.0 (Laravel Cashier, Monica's subscriptions) sets `CURLOPT_CAINFO`
+  to `Stripe::getCABundlePath()`, i.e. `data/ca-certificates.crt`, as in InvoicePlane. composer/ca-bundle
+  1.5.0's only user is maxmind/web-service-common (GeoIP2 web service, through stevebauman/location's
+  MaxMind driver; `web.enabled` is `false` in Monica's `config/location.php`), which hands
+  `getSystemCaRootBundlePath()` to curl.
+- Shim (`shims/monica.nix`): one GET through `\Stripe\HttpClient\CurlClient::instance()`, then one GET with
+  `CURLOPT_CAINFO = getSystemCaRootBundlePath()`. Exit 0 only if both succeed, so the CONNECTED cell
+  covers both files.
+- Shim logs: before cells show both paths in `.../monica-4.1.2/vendor/...`, stripe-php's
+  `ApiConnectionException: Could not verify Stripe's SSL certificate ... (Network error [errno 60]: SSL
+  certificate OpenSSL verify result: unable to get local issuer certificate (20))` and `curl with that CAINFO:
+  error 60`; after-test shows both resolving to the test-root cacert's `ca-no-trust-rules-bundle.crt`,
+  `CurlClient: status 200` and `curl with that CAINFO: status 200`.
+
+### n98-magerun2: static FIXED, behavioral PASS for the library default (n98-magerun2's own calls do not read the file)
+
+90 s in total, run concurrently with monica (matrix 36 s).
+
+```
+| out:/share/php/n98-magerun2/vendor/rmccue/requests/certificates/cacert.pem | pem 121 certs: 3 not in cacert, 0 in cacert but not for TLS, 0 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT n98-magerun2: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT n98-magerun2: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What reads the file: rmccue/requests 2.0.20's default `verify` is `Requests::$certificate_path`
+  (`certificates/cacert.pem`). **n98-magerun2's own calls never use that default**: every one
+  (`self-update`, `github:pr`, `DownloadHelper`, `MariaDbLifecycleClient`, `MagentoWatchClient`) passes
+  `'verify' => true`, and Requests then leaves `CURLOPT_CAINFO` unset, so libcurl's default store is used.
+  The file is only the library default for other code on n98-magerun2's autoloader (`dev:console`, module
+  commands) that calls Requests without `verify`. The PASS is for that default.
+- Shim (`shims/n98-magerun2.nix`): prints the outcome of an n98-magerun2-style call (`verify => true`) for
+  information, reduced to the cURL error number so that it cannot be taken for the verdict's refusal, then
+  one `Requests::get($URL)` with the library default; the exit code is that GET's.
+- Shim logs: every cell, after-test included, prints
+  `informational, n98-magerun2 style (verify => true, libcurl default store): cURL error 60`: those calls
+  ignore both the vendored file and cacert (the sandbox has no system store). The library-default GET
+  refuses in the before cells and after-stock, and after-test prints `status 200`.
+
+### phpPackages.castor: no change needed, covered by the merged builder fix (static FIXED at its merge commit)
+
+castor is built with `php.buildComposerProject2`, so NixOS/nixpkgs#576561 (merged 2026-10-21 20:37 UTC,
+after the fix branch's base) covers it. Static check against the merge commit, 64 s:
+`nix run path:<harness>#static -- phpPackages.castor --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:NixOS/nixpkgs/cd371f2bc2729484a060c231f5591b095fc5be4d`
+
+```
+| out:/share/php/castor/vendor/composer/ca-bundle/res/cacert.pem | pem 121 certs: 3 not in cacert, 0 in cacert but not for TLS, 0 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT phpPackages.castor: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+```
+
+The builder hook links `ca-bundle.crt` (the trust-rules bundle), not the plain one the per-package
+fixes use; both are cacert. (`castor` without the prefix is an unrelated Rust Gemini client.)
+
+### flyspray: no shim; the vendored Guzzle 3 bundle cannot be reached on PHP 8
+
+flyspray's only reader of `vendor/guzzle/guzzle/src/Guzzle/Http/Resources/cacert.pem` is Guzzle 3.9.3
+(`Client::setSslVerification(true)` sets `CURLOPT_CAINFO` to it), used by league/oauth2-client 0.12.1 for
+the OAuth logins. Guzzle 3.9.3's `CurlHandle::__construct` throws unless `is_resource($handle)`, and since
+PHP 8.0 `curl_init()` returns a `CurlHandle` object, so every request fails before any TLS. A shim built
+like the others (the client from `new League\OAuth2\Client\Provider\Google([...])->getHttpClient()`, as
+flyspray's `scripts/oauth.php` gets it), run by hand with nixpkgs' PHP 8.5.12 against the unmodified
+output, prints `Guzzle\Service\Client CURLOPT_CAINFO .../Guzzle/Http/Resources/cacert.pem` and then
+`Uncaught Guzzle\Common\Exception\InvalidArgumentException: Invalid handle provided`. nixpkgs has no
+PHP older than 8.2, so there is no TLS behavior to test: all four cells would be ERROR.
