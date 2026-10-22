@@ -148,7 +148,7 @@ out-negative/, out-fallback/  working files of the negative-control and no-scann
   - When all requested outputs are already valid store paths (`nix path-info`), nothing is
     built or fetched, and the queue is skipped.
   - Every side is dry-run first. If a side would build more than `CAH_MAX_BUILDS` (4)
-    derivations, or anything matching `CAH_HEAVY_RE` (julia, graalvm, openjdk, llvm, rustc,
+    derivations, or anything matching `CAH_HEAVY_RE` (julia, graalvm, openjdk, corretto, llvm, rustc,
     qtwebengine, ...), it is **skipped**. The static check then prints `git diff <base> -- <pkg dir>`
     instead (diff-only). Use `--force-build` to override.
 - **Tools** (openssl, keytool, python3, ...) always come from the *base* nixpkgs. A

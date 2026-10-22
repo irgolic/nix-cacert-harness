@@ -12,7 +12,7 @@ CAH_SCANNER_REF=${CAH_SCANNER_REF:-github:zimbatm/nix-cacert-scan/3bae26b1140e29
 # Max number of derivations a side may need to *build* before we refuse (diff-only).
 CAH_MAX_BUILDS=${CAH_MAX_BUILDS:-4}
 # Anything matching this in the to-build list is considered a big from-source build.
-CAH_HEAVY_RE=${CAH_HEAVY_RE:-'-(julia|kodi|jetbrains|graalvm|supertuxkart|chromium|firefox|thunderbird|electron|llvm|clang|gcc|rustc|ghc|qtbase|qtwebengine|webkitgtk|openjdk|libreoffice|linux|mesa|texlive|ffmpeg|boost|gtk[34]?|nodejs|go|python3)-[0-9]'}
+CAH_HEAVY_RE=${CAH_HEAVY_RE:-'-(julia|kodi|jetbrains|graalvm|supertuxkart|chromium|firefox|thunderbird|electron|llvm|clang|gcc|rustc|ghc|qtbase|qtwebengine|webkitgtk|openjdk|corretto[0-9]*|libreoffice|linux|mesa|texlive|ffmpeg|boost|gtk[34]?|nodejs|go|python3)-[0-9]'}
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "error: $*"; exit 2; }
