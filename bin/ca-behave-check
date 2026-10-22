@@ -2,7 +2,7 @@
 # ca-behave-check: behavioral proof that a package's TLS trust is wired to cacert.
 #
 #   ca-behave-check [--base REV] [--after REV] [--after-overlay FILE] [--shim NAME|FILE] [--sides "before after"]
-#                   [--force-build] [--rerun] ATTR
+#                   [--force-build] [--dry-run-only] [--rerun] ATTR
 #
 # For each side (before = base commit, after = --after REV or the worktree) and each cacert variant
 # (stock, stock + throwaway test root) it builds one sandboxed "cell" derivation
@@ -15,7 +15,7 @@
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
-pr= base= after= overlay= shim= shim_arg= sides="before after" force=0 salt= attr=
+pr= base= after= overlay= shim= shim_arg= sides="before after" force=0 dry_only=0 salt= attr=
 while (( $# )); do
   case $1 in
     --base) base=$2; shift 2 ;;
@@ -25,8 +25,10 @@ while (( $# )); do
     --shim) shim_arg=$2; shift 2 ;;
     --sides) sides=$2; shift 2 ;;
     --force-build) force=1; shift ;;
+    --dry-run-only) dry_only=1; shift ;;
     --rerun) salt=$(date +%s); shift ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -*) die "unknown option $1" ;;
     *) attr=$1; shift ;;
   esac
 done
@@ -72,6 +74,11 @@ cah_dry_run "$W/all.to-build" "${margs[@]}" "${cells[@]}"
 grep -Ev "$own_re" "$W/all.to-build" > "$W/all.to-build.pkg" || true
 log "  package derivations to build for the matrix: $(grep -c . "$W/all.to-build.pkg") $(sed 's|.*/[a-z0-9]\{32\}-||' "$W/all.to-build.pkg" | tr '\n' ' ')"
 pol=$(cah_build_policy "$W/all.to-build.pkg")
+if (( dry_only )); then
+  log "  dry-run only: build policy: $pol; nothing built"
+  echo "VERDICT $attr: DRY-RUN (matrix not built)"
+  exit 0
+fi
 if [[ $pol != ok && $force == 0 ]]; then
   for cell in "${cells[@]}"; do RES[$cell]="SKIPPED"; done
   log "  SKIPPED: ${pol#heavy:} (use --force-build, or rely on ca-static-check)"
