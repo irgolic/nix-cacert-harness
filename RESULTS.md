@@ -1094,3 +1094,60 @@ VERDICT tlaplus-toolbox: PASS: after-fix trust follows cacert; before-fix ignore
   `java.home=/nix/store/…-tlaplus-toolbox-1.7.4/libexec/toolbox/plugins/org.lamport.openjdk.linux.x86_64_14.0.1.7/jre`;
   the refusing cells end in `SSLHandshakeException: PKIX path building failed`, after-test prints
   `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
+
+### corretto21 (fix branch, from source): static FIXED, behavioral PASS
+
+`--after 16ac381777146d63330e531d812a4e7a09e75f8a` (`cacert/corretto`, "corretto: generate cacerts from
+cacert"; the fix is in `mk-corretto.nix`, so it covers corretto11/17/21/25; only `corretto21`,
+21.0.9.11.1, was run). Corretto is `jdk21.overrideAttrs` with `dontConfigure = true`: Corretto's
+gradle build runs OpenJDK's `configure` itself, so the `preConfigure` in which openjdk (#576518)
+generates `cacerts` from cacert and adds `--with-cacerts-file` never runs. Before the fix the only
+`--with-cacerts-file` was Corretto's own, pointing at the store its gradle `prebuild` tasks make
+(`generateJdkCacerts`, then `importAmazonCacerts`: "Importing keystore /build/source/amazon-cacerts to
+cacerts..."). The fix generates `$NIX_BUILD_TOP/cacerts-gen/cacerts` in `preBuild` with
+`jre-generate-cacerts` and appends `--with-cacerts-file=` for it to `corretto.extra_config`.
+
+A from-source OpenJDK build, not in the binary cache on either side: three corretto21 builds, one
+nixb slot (4 cores, `--max-jobs 1`, so one after another), machine load 17 to 20 on 16 cores:
+
+| build | start-end (UTC, from the nix log files) | time |
+|---|---|---|
+| after (fix) | 00:31:11-00:59:56 | 28:45 (gradle: "BUILD SUCCESSFUL in 27m 11s") |
+| after, test-root cacert (matrix) | 01:00:01-01:28:08 | 28:07 (gradle 23m 39s) |
+| before (base) | 01:28:24-01:48:10 | 19:46 (gradle 18m 58s) |
+
+The matrix run took 1:19:47 in total. It ran without `--force-build` because of two harness bugs,
+both fixed now: `--dry-run-only` did not reach `ca-behave-check` (so the "dry run" built the
+matrix), and `CAH_HEAVY_RE` did not match `corretto21-…` while the matrix had only 4 drvs to build
+(3 corretto21 and gradle-8.14.4, a binary-distribution repackaging), so the policy let it through.
+Nothing else was built from source. The cleaned output is the final run with `--force-build`,
+everything cached (45 s).
+
+```
+| out:/lib/corretto/lib/security/cacerts | keystore 146 certs: 43 not in cacert, 19 in cacert but not for TLS, 34 cacert TLS roots missing [no-password]; scanner: AAA,ECC G3 | keystore 118 certs == cacert [no-password] |
+VERDICT corretto21: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT corretto21: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Which `--with-cacerts-file` wins: the fix's author expected the appended flag to take precedence
+  over Corretto's own. The after build's log shows both flags, Corretto's first and the fix's last:
+  `using configure arguments '--with-cacerts-file=/build/source/pre-build/corretto-build/distributions/cacerts … --with-cacerts-file=/build/cacerts-gen/cacerts'`,
+  and configure took the last one: `checking for cacerts file... /build/cacerts-gen/cacerts`. The
+  before build's log has only Corretto's flag and `checking for cacerts file... /build/source/pre-build/corretto-build/distributions/cacerts`.
+  The built store confirms it: the after keystore is exactly cacert's 118 TLS roots
+  (`keytool -list -cacerts`: "Your keystore contains 118 entries"), where Corretto's own has 146,
+  and the test-root rebuild trusts the test root.
+- Shim: `shims/corretto21.nix` -> `java-runtime.nix`. Injection is the default: `corretto21` is
+  `callPackage ../development/compilers/corretto/mk-corretto.nix { majorVersion = "21"; }`, so its
+  `.override` is `mk-corretto.nix`'s, which declares `cacert` after the fix. The test-root rebuild
+  changes only the `cacert` that `preBuild` uses (`jdk21` itself is not overridden). On the base
+  `mk-corretto.nix` does not declare it: before-test is a NO-OP.
+- Shim logs: every cell prints `java.home=/nix/store/…-corretto21-21.0.9.11.1/lib/corretto trustStore=(default)`;
+  the refusing cells end in `PKIX path building failed`, after-test prints
+  `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
+- "cacert in runtime closure: no" on both sides is expected: the keystore is generated at build time.

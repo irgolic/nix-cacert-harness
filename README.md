@@ -45,7 +45,7 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
-`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`, `eclipses.eclipse-java`, `zoneminder`, `tracecompass`, `tlaplus-toolbox`; any JVM can reuse
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`, `eclipses.eclipse-java`, `zoneminder`, `tracecompass`, `tlaplus-toolbox`, `corretto21`; any JVM can reuse
 `shims/java-runtime.nix` (a JRE bundled inside an app: `shims/bundled-jre.nix`), any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
 instead of the installed package (`--shim python-wheel-raven` for raven's). Results and logs land in
@@ -315,7 +315,7 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
     `postPatch` fix (the wheel gets cacert's bundle) from a `postInstall` one (it does not).
   - `shims/java-runtime.nix`: `java -cp ${probes.java} TlsProbe $URL`. It works for any
     JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `openjdk`,
-    `jre_minimal`. `shims/zulu.nix` runs the same probe with its own `inject`.
+    `jre_minimal`, `corretto21` (from source; default injection through `mk-corretto.nix`). `shims/zulu.nix` runs the same probe with its own `inject`.
   - For apps that bundle a jlink'd runtime, use `"$PKG/<runtime>/bin/java"` in the same line.
     The probe only needs `java.base`. `shims/bundled-jre.nix` does that for a glob of the JRE
     directory (it must match exactly one), with `loader = true` for a JRE the package leaves
