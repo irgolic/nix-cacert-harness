@@ -729,3 +729,94 @@ VERDICT h2o: PASS: after-fix trust follows cacert; before-fix ignores it
   `h2o-httpclient: unable to get local issuer certificate`. after-test prints the test-root cacert's
   path, `HTTP/1 200 ok`, `h2o-httpclient: I/O timeout` and `status 200 received after the verified handshake`.
 
+### python3Packages.raven, `dist` wheel (fix branch, postPatch): behavioral PASS; the postInstall version FAILS
+
+The fix branch `cacert/python3Packages.raven` is now `bdcce494d`. It makes the symlink in `postPatch`,
+in the source tree, as the httplib2 fix does: `ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt raven/data/cacert.pem`.
+The wheel in the `dist` output is built from that tree, so it gets cacert's bundle too. The new shim
+`shims/python-wheel-raven.nix` runs raven's request against that wheel.
+
+Run on 2026-10-22 from `/` with the local flake, against commits of the local nixpkgs checkout
+(`CAH_REPO=/home/rafael/nixpkgs`, exported with `fetchGit`):
+
+```sh
+nix run path:. -- python3Packages.raven --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after bdcce494d6d60d0c8f0cbec7554583d52cc73588 --shim python-wheel-raven
+nix run path:. -- python3Packages.raven --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after ce68df1c722b0132567b24298ab000378c45fce3 --shim python-wheel-raven   # negative control
+```
+
+2:08 and 1:10 in total. Nothing was built except the cells: both sides and the test-root raven were
+already in the store. Cleaned output: `runs/python3Packages.raven-wheel.txt` in the gist.
+
+Fix branch (`bdcce494d`):
+
+```
+| out:/lib/python3.14/site-packages/raven/data/cacert.pem | pem 155 certs: 94 not in cacert, 19 in cacert but not for TLS, 76 cacert TLS roots missing; scanner: AAA | byte-identical copy of a cacert bundle: pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+inside archives (scanner only; a symlink in the installed output cannot reach them, issue #576542 class):
+  before dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem  roots=107 trusts AAA Certificate Services
+  after  dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem  roots=166, byte-identical copy of cacert:ca-bundle.crt
+VERDICT python3Packages.raven: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ after-side archive copies are byte-identical to cacert)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT python3Packages.raven: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+Negative control, the first (`postInstall`) version of the fix (`ce68df1c7`), same shim:
+
+```
+  after  dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem  roots=107 trusts AAA Certificate Services
+VERDICT python3Packages.raven: FIXED: ... (+ bundles inside archives remain, see above)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | REFUSED      | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT python3Packages.raven: FAIL: after-fix package does not trust the test root added to cacert (...)
+```
+
+- Shim (`shims/python-wheel-raven.nix`): `shims/python-wheel.nix` with the request of
+  `shims/python3Packages.raven.nix`. pip installs `${pkg.dist}/*.whl` offline into the sandbox.
+  The interpreter has pip only (raven declares no required Python dependencies), so `certifi` is
+  not importable (checked). `ssl.wrap_socket` is restored before raven is imported. Then one
+  `HTTPTransport(timeout=10).send(url, None, {})`.
+- Shim logs: every cell prints `raven 6.10.0 from /build/wheel/raven/__init__.py` and
+  `CA_BUNDLE = /build/wheel/raven/data/cacert.pem`, a regular file (the wheel holds the content, not a
+  symlink). The refusing cells end in `urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify
+  failed: unable to get local issuer certificate`. after-test on the fix branch prints `status 200`.
+- The negative control is the commit whose installed package passed in "python3Packages.raven (fix
+  branch)" above. Its wheel was rebuilt with the test-root cacert but still carries the vendored file,
+  so the wheel shim refuses. The installed-package shim cannot tell the two versions apart; the wheel
+  shim can.
+- The before cells are the same store paths in both runs.
+
+### `shims/python-wheel.nix` generalized: httplib2 wheel re-run, PASS (no regression)
+
+`shims/python-wheel.nix` now takes optional `module`, `prelude` and `snippet` arguments, with the
+httplib2 request as the default. A wheel shim for another library is a two-line file,
+`args: import ./python-wheel.nix (args // { module = "..."; snippet = "..."; })`, not a copy.
+`--shim python-wheel` alone behaves as before. Its generated script differs slightly: `CA_CERTS` is
+printed after the wheel-origin check, the version is read with `getattr`, and there is a blank line.
+So its cells re-ran.
+
+Re-run against the httplib2 fix branch, 1:50 in total, cleaned output
+`runs/httplib2-wheel-generalized.txt` in the gist:
+
+```sh
+nix run path:. -- python3Packages.httplib2 --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/e4b7d4ce526cf04c114f650fb2c8143cf2761b8b --shim python-wheel
+```
+
+```
+VERDICT python3Packages.httplib2: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ after-side archive copies are byte-identical to cacert)
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT python3Packages.httplib2: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+The matrix and verdict are the same as in "python3Packages.httplib2 (fix branch, postPatch)". after-test
+prints `httplib2 0.32.0 from /build/wheel/httplib2/__init__.py`, `CA_CERTS = /build/wheel/httplib2/cacerts.txt`
+and `status 200`. The other three cells end in `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`.
+

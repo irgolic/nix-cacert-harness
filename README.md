@@ -48,7 +48,7 @@ behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Package
 `temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`; any JVM can reuse
 `shims/java-runtime.nix`, any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
-instead of the installed package. Results and logs land in
+instead of the installed package (`--shim python-wheel-raven` for raven's). Results and logs land in
 `${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
 4 cores each, and a side whose dry-run shows a long from-source build is skipped (diff-only)
 unless `--force-build` is given. `nix` and `git` are taken from your PATH.
@@ -301,7 +301,12 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
     --no-index --no-deps --target`), with an interpreter that has pip and the package's Python
     dependencies but not the package, and checks that the import comes from the wheel. The
     test variant rebuilds the package, so the wheel is rebuilt with the test-root cacert and the
-    expected matrix is the same as for the installed package.
+    expected matrix is the same as for the installed package. As a shim it does the httplib2
+    request; it also takes optional `module`, `prelude` (run before the import) and `snippet`
+    arguments, so the wheel shim for another library is
+    `args: import ./python-wheel.nix (args // { module = "…"; snippet = "…"; })`.
+    `shims/python-wheel-raven.nix` (`--shim python-wheel-raven`) is raven's: it tells a
+    `postPatch` fix (the wheel gets cacert's bundle) from a `postInstall` one (it does not).
   - `shims/java-runtime.nix`: `java -cp ${probes.java} TlsProbe $URL`. It works for any
     JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `openjdk`,
     `jre_minimal`. `shims/zulu.nix` runs the same probe with its own `inject`.
@@ -332,8 +337,9 @@ $H/bin/ca-behave-check <attr>   # approach 2 only
 
 To add a package to the behavioral check:
 - **JVM**: `ln -s java-runtime.nix shims/<attr>.nix`.
-- **Python library**: copy `python-lib.nix` and edit the 3-line snippet. Its wheel: copy
-  `python-wheel.nix` the same way, and run with `--shim <name>`.
+- **Python library**: copy `python-lib.nix` and edit the 3-line snippet. Its wheel: a
+  `shims/python-wheel-<name>.nix` that imports `python-wheel.nix` with `module`/`snippet` (see
+  `python-wheel-raven.nix`), run with `--shim python-wheel-<name>`.
 - **Ruby gem** (gem-config fixes): a `shims/rubyPackages.<gem>.nix` of the form
   `args: import ./ruby-gem.nix args { require = "..."; code = "..."; }` (see `rubyPackages.excon.nix`);
   `ruby-gem.nix` injects the test cacert through `defaultGemConfig.override { cacert }`.
