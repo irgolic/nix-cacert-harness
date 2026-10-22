@@ -45,8 +45,8 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
-`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`; any JVM can reuse
-`shims/java-runtime.nix`, any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`, `eclipses.eclipse-java`; any JVM can reuse
+`shims/java-runtime.nix` (a JRE bundled inside an app: `shims/bundled-jre.nix`), any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
 instead of the installed package (`--shim python-wheel-raven` for raven's). Results and logs land in
 `${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness/<attr>/`. Builds are bounded to 3 at a time,
@@ -218,6 +218,12 @@ Rules for "bad":
 - A symlink into cacert, or a byte-identical copy of a cacert bundle, is good by definition.
   This holds even for `ca-bundle.crt`, which carries non-TLS roots as trust-rule blocks that
   OpenSSL honours.
+- JAR signature blocks (`META-INF/*.RSA`, `*.DSA`, `*.EC`, as files or inside archives) are not
+  stores: they are PKCS#7 SignedData with the signer's certificate chain. The scanner flags them
+  (it reads their DER as `pkcs12`, and they hold a few known roots, e.g. DigiCert's code-signing
+  roots); Eclipse-based apps have hundreds. They are counted on one line per side and not judged,
+  unless one has 20 or more known roots or a watched root. The unfiltered list is
+  `static/<side>/findings-all.tsv`.
 
 ## Approach 2: behavioral check (`ca-behave-check`)
 
@@ -311,7 +317,10 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
     JDK/JRE attr, and is symlinked as `temurin-jre-bin`, `temurin-bin`, `openjdk`,
     `jre_minimal`. `shims/zulu.nix` runs the same probe with its own `inject`.
   - For apps that bundle a jlink'd runtime, use `"$PKG/<runtime>/bin/java"` in the same line.
-    The probe only needs `java.base`.
+    The probe only needs `java.base`. `shims/bundled-jre.nix` does that for a glob of the JRE
+    directory (it must match exactly one), with `loader = true` for a JRE the package leaves
+    unpatched (it runs `bin/java` through nixpkgs' dynamic loader; the probe prints `java.home`,
+    which stays the bundled JRE). Used by `eclipses.eclipse-java` (JustJ).
 
 Sketched, untested shim ideas for other families:
 - **PHP/composer apps**: `php -r` that `require`s the app's
@@ -336,7 +345,8 @@ $H/bin/ca-behave-check <attr>   # approach 2 only
 ```
 
 To add a package to the behavioral check:
-- **JVM**: `ln -s java-runtime.nix shims/<attr>.nix`.
+- **JVM**: `ln -s java-runtime.nix shims/<attr>.nix`. A JRE inside an app's output:
+  `args: import ./bundled-jre.nix args { jre = "<glob>"; }` (see the header of `bundled-jre.nix`).
 - **Python library**: copy `python-lib.nix` and edit the 3-line snippet. Its wheel: a
   `shims/python-wheel-<name>.nix` that imports `python-wheel.nix` with `module`/`snippet` (see
   `python-wheel-raven.nix`), run with `--shim python-wheel-<name>`.

@@ -174,6 +174,20 @@ for attr in "${attrs[@]}"; do
   done
   (( same )) && echo "NOTE: identical derivation on both sides -> no fix in the worktree for $attr"
 
+  # JAR signature blocks (META-INF/*.RSA, *.DSA, *.EC: PKCS#7 SignedData carrying the signer's
+  # certificate chain, e.g. DigiCert code-signing roots) are not trust stores. The scanner flags
+  # them (its DER check calls them pkcs12, and they hold a few known roots); Eclipse-based apps
+  # carry hundreds, in features/*/META-INF and inside every signed jar. List them apart and do
+  # not count them, unless one looks like a store (>= 20 known roots or a watched root).
+  # The unfiltered findings stay in findings-all.tsv.
+  sig_awk='$2 ~ /(^|\/|!)META-INF\/[^\/!]+\.(RSA|DSA|EC)$/ && $3 != "?" && $3+0 < 20 && $4 == ""'
+  for side in before after; do
+    [[ -e $W/$side/findings.tsv ]] || continue
+    mv "$W/$side/findings.tsv" "$W/$side/findings-all.tsv"
+    awk -F'\t' "$sig_awk" "$W/$side/findings-all.tsv" > "$W/$side/sigblocks.tsv"
+    awk -F'\t' "!($sig_awk)" "$W/$side/findings-all.tsv" > "$W/$side/findings.tsv"
+  done
+
   # candidates: real-file trust stores and symlinks into cacert, on either side
   cands=$( { cut -f1,2 "$W"/before/findings.tsv "$W"/after/findings.tsv 2>/dev/null
              cut -f1,2 "$W"/before/links.tsv "$W"/after/links.tsv 2>/dev/null; } | grep -v '!' | sort -u)
@@ -216,6 +230,15 @@ for attr in "${attrs[@]}"; do
     done
     read -r arch_after arch_bad_after < <(awk -F'\t' 'NR==FNR {c[$1]; next} $2 ~ /!/ {n++; if (!($7 in c)) b++} END {print n+0, b+0}' \
       "$ref_dir/sha256-names" "$W/after/findings.tsv" 2>/dev/null || echo "0 0")
+  fi
+  sigs=()
+  for side in before after; do
+    [[ -s $W/$side/sigblocks.tsv ]] || continue
+    sigs+=("$side $(awk -F'\t' '{ if ($2 ~ /!/) a++; else f++ } END { printf "%d files + %d in archives", f, a }' "$W/$side/sigblocks.tsv")")
+  done
+  if (( ${#sigs[@]} )); then
+    echo; echo "jar signature blocks (META-INF/*.RSA|DSA|EC: code-signing certificate chains, not trust stores; not counted; listed in static/<side>/sigblocks.tsv):"
+    printf '  %s\n' "${sigs[@]}"
   fi
   echo
   for side in before after; do

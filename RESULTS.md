@@ -820,3 +820,64 @@ The matrix and verdict are the same as in "python3Packages.httplib2 (fix branch,
 prints `httplib2 0.32.0 from /build/wheel/httplib2/__init__.py`, `CA_CERTS = /build/wheel/httplib2/cacerts.txt`
 and `status 200`. The other three cells end in `CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`.
 
+
+## Java fixes that bundle or build a JRE (run against local fix branches)
+
+Run on 2026-10-22 from `/` against the local nixpkgs checkout (several branches were not pushed
+yet), so `--after` is a bare sha that the harness exports with `builtins.fetchGit` from `$CAH_REPO`:
+`CAH_REPO=/home/rafael/nixpkgs nix run path:. -- <attr> --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after <sha>`.
+Cleaned outputs are `runs/<attr>.txt` in the gist.
+
+Two harness changes came out of these runs:
+- `ca-behave-check` now honours `--dry-run-only`. Before, `ca-check` passed the flag on and
+  `ca-behave-check` took it for the attribute name (the real one came last and won), so a "dry run"
+  of corretto21 started the whole matrix build.
+- `ca-static-check` lists JAR signature blocks (`META-INF/*.RSA|DSA|EC`) on one line per side
+  instead of judging them as stores (see "Rules for bad" in the README). They are PKCS#7 signatures
+  with DigiCert code-signing chains; the scanner reads their DER as `pkcs12`. eclipse-java has 56
+  as files (`features/*/META-INF/ECLIPSE_.RSA`) and 416 inside jars, identical before and after, and
+  each one showed up as "pem: 0 certs readable", which made the first static verdict NOT FIXED.
+
+### eclipses.eclipse-java (fix branch): static FIXED, behavioral PASS
+
+`--after ff12820b84025631641ac710ea026f2d1f932c77` (`cacert/eclipses`, "eclipses: generate the bundled
+JustJ JRE's cacerts from cacert"): `build-eclipse.nix` regenerates
+`eclipse/plugins/org.eclipse.justj.openjdk.*/jre/lib/security/cacerts` with `jre-generate-cacerts`
+(using the keytool of nixpkgs' `jdk25`, since the bundled JRE is not patched). eclipse-java 4.41 ships
+JustJ `hotspot.jre.full.linux.x86_64_25.0.4`. First run 7:59 in total: the before side was built
+(18 s), the after side was already in the store, and the matrix built the test-root eclipse-java once
+(144 s, queue wait included). The re-run with the signature-block change, everything cached: 2:23.
+
+```
+| out:/eclipse/plugins/org.eclipse.justj.openjdk.hotspot.jre.full.linux.x86_64_25.0.4.v20260826-0822/jre/lib/security/cacerts | keystore 118 certs: 4 not in cacert, 1 in cacert but not for TLS, 5 cacert TLS roots missing [no-password]; scanner: ECC G3 | keystore 118 certs == cacert [no-password] |
+jar signature blocks (META-INF/*.RSA|DSA|EC: code-signing certificate chains, not trust stores; not counted; listed in static/<side>/sigblocks.tsv):
+  before 56 files + 416 in archives
+  after 56 files + 416 in archives
+VERDICT eclipses.eclipse-java: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT eclipses.eclipse-java: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What this proves: Eclipse itself does not run on the JustJ JRE. `build-eclipse.nix` deletes the
+  JustJ `-vm` line from `eclipse.ini` and the wrapper puts nixpkgs' `jdk` on `PATH`, so the IDE's own
+  TLS (update sites, marketplace) uses nixpkgs' JDK store, which #576518 already wires to cacert. The
+  run proves that the *bundled* JRE's store is wired to cacert. That matters for anything that
+  launches that JRE.
+- Shim (`shims/eclipses.eclipse-java.nix`, on the new shared `shims/bundled-jre.nix`): the TLS probe
+  on `eclipse/plugins/org.eclipse.justj.openjdk.*/jre/bin/java` (the glob must match exactly one
+  JRE). The package leaves that JRE unpatched (its interpreter is `/lib64/ld-linux-x86-64.so.2`, which
+  the sandbox does not have), so the shim runs `bin/java` through nixpkgs' `ld-linux` with glibc and
+  zlib on `--library-path`. The JVM still takes its `java.home` from `libjli.so`'s location: every cell
+  prints `java.home=/nix/store/…-eclipse-java-4.41/eclipse/plugins/org.eclipse.justj.openjdk.hotspot.jre.full.linux.x86_64_25.0.4.v20260826-0822/jre trustStore=(default)`.
+- Injection: the attr is `buildEclipseUnversioned` (`callPackage ./build-eclipse.nix { … }` in
+  `eclipse/default.nix`) applied to per-edition data, so the derivation has no `.override` and the
+  default injection would be a NO-OP. The shim re-evaluates `pkgs.eclipses.override { callPackage = … }`
+  with a `callPackage` that also passes `cacert` to functions that declare it, and takes the same
+  `pname`. It does so only when that side's `build-eclipse.nix` declares `cacert`; the base does not,
+  so before-test is the before-stock derivation (NO-OP).
+- Shim logs: the three refusing cells end in `SSLHandshakeException: (certificate_unknown) PKIX path
+  building failed`; after-test prints `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
