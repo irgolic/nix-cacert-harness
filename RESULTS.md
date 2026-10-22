@@ -950,3 +950,147 @@ VERDICT eclipses.eclipse-java: PASS: after-fix trust follows cacert; before-fix 
   so before-test is the before-stock derivation (NO-OP).
 - Shim logs: the three refusing cells end in `SSLHandshakeException: (certificate_unknown) PKIX path
   building failed`; after-test prints `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
+
+### zoneminder (fix branch): static FIXED, behavioral PASS (through CakePHP's HttpSocket; ZoneMinder itself never calls it)
+
+Run on 2026-10-22 from `/` with the local flake, against the local fix branch
+(`CAH_REPO=/home/rafael/nixpkgs`, exported with `fetchGit`):
+`nix run path:. -- zoneminder --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after f4c5ad55551598db27e6a15d07b5317bc039f84c`
+(`f4c5ad555`, "zoneminder: use cacert bundle instead of vendored CakePHP CA bundle": in `postInstall`,
+`share/zoneminder/www/api/lib/Cake/Config/cacert.pem` becomes a symlink to cacert's
+`ca-no-trust-rules-bundle.crt`). zoneminder is a C++ build and was built three times, one drv each,
+nothing else: before (670 s), after (507 s), and the test-root after in the matrix (708 s, queue wait
+included). 32:21 in total. The dry-run policy allowed it, so `--force-build` was not needed. Cleaned
+output: `runs/zoneminder.txt` in the gist.
+
+```
+| out:/share/zoneminder/www/api/lib/Cake/Config/cacert.pem | pem 152 certs: 96 not in cacert, 19 in cacert but not for TLS, 81 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-no-trust-rules-bundle.crt pem 118 certs == cacert |
+VERDICT zoneminder: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT zoneminder: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+What reads the file (checked in the built output, CakePHP 2.10.24 as shipped in ZoneMinder 1.38.6):
+- `lib/Cake/Network/CakeSocket.php`, `_setSslContext()`: when the caller gives no `cafile`, it sets
+  the stream context's `ssl.cafile` to `CAKE . 'Config' . DS . 'cacert.pem'`. This applies to every
+  TLS `CakeSocket`: `HttpSocket`, and `SmtpTransport` (CakeEmail).
+- `HttpSocket` defaults to `ssl_verify_peer => true`, `ssl_verify_host => true`,
+  `ssl_allow_self_signed => false`, so a caller has to switch nothing on.
+- **ZoneMinder's own code never constructs `HttpSocket`, `CakeSocket` or `CakeEmail`.** Nothing
+  outside `api/lib/Cake/` mentions them, except a comment in `api/app/Config/email.php.default`.
+  The PHP outside the API (`www/includes`, `www/ajax`) uses curl and `file_get_contents`, which do not
+  read this file.
+- The one route from a ZoneMinder install to that socket is CakePHP's XML request-body parsing.
+  - Every API controller loads `RequestHandler` (`AppController::$components`; several controllers list it
+    again).
+  - Its `startup()` runs after ZoneMinder's `beforeFilter()`, i.e. after the API-enabled and
+    authentication checks. For a POST/PUT/PATCH/DELETE with an XML content type it calls
+    `convertXml()`, which is `Xml::build($body, array('readFile' => false))`.
+  - `Xml::build` tests `$options['readFile'] && strpos($input, 'http://') === 0 || strpos($input, 'https://') === 0`.
+    By operator precedence, a body that starts with `https://` is fetched with
+    `new HttpSocket(array('request' => array('redirect' => 10)))` even with `readFile => false`.
+- So the file decides whether the ZoneMinder server trusts an `https://` URL sent as an XML request
+  body to its API. That is a framework quirk, not a feature ZoneMinder uses, but it is the code path
+  that exists. A behavioral test cannot cover anything more direct here.
+
+Shim (`shims/zoneminder.nix`, modeled on `wordpress.nix`):
+- `php -r` loads the shipped CakePHP class loader: the path constants, `basics.php`, `Core/App.php`,
+  `Error/exceptions.php` and `spl_autoload_register(array('App', 'load'))`. It loads no app config and
+  no database.
+- `__d` (translation) is stubbed before `basics.php`, which only defines it when it is missing. The
+  real one needs `Configure` and the I18n cache.
+- It prints what `Xml::build($URL, array('readFile' => false))` returns, as `convertXml` calls it.
+  This is informational: `Xml::build` turns a TLS failure into `XML cannot be read.`
+- It then does one `get($URL)` with an `HttpSocket` built exactly as `Xml::build` builds it, with the
+  default ssl options. The exit code is that GET's.
+
+Shim logs:
+- before-stock and before-test: `Cake/Config/cacert.pem -> .../zoneminder-1.38.6/share/zoneminder/www/api/lib/Cake/Config/cacert.pem`
+  (the vendored file).
+- after-stock: `-> .../nss-cacert-3.131.1/etc/ssl/certs/ca-no-trust-rules-bundle.crt`.
+- In all three refusing cells: `Xml::build(URL, readFile=false): XmlException: XML cannot be read.`,
+  `HttpSocket ssl_verify_peer=true`, `HttpSocket context cafile .../api/lib/Cake/Config/cacert.pem`. Then
+  CakeSocket's uncaught `SocketException: stream_socket_client(): SSL operation failed with code 1.
+  OpenSSL Error messages: error:0A000086:SSL routines::certificate verify failed`.
+- after-test points to the test-root cacert's bundle, prints
+  `Xml::build(URL, readFile=false): root <HTML>` (the test server's status page parses as XML) and
+  `status 200`.
+- The shim was first tried outside the sandbox against the after output built earlier, and against a
+  copy of its `lib/Cake` with `Config/cacert.pem` replaced by the test root: refused and connected
+  respectively.
+
+### tracecompass (fix branch): static FIXED, behavioral PASS
+
+`--after 62ddcd75b9ac59961906fa358ec1fcc572e818d4` (`cacert/tracecompass`, "tracecompass: generate the
+bundled JustJ JRE's cacerts from cacert"): the `installPhase` regenerates
+`trace-compass/plugins/org.eclipse.justj.openjdk.*/jre/lib/security/cacerts` with `jre-generate-cacerts`
+and nixpkgs' `jdk21` keytool. Trace Compass 11.2.0 ships JustJ `hotspot.jre.minimal.stripped.linux.x86_64_21.0.9`.
+First run 4:52 in total (before built in 34 s, after in 51 s, the test-root tracecompass in the
+matrix in 76 s, queue waits included); the cleaned output is the re-run with the signature-block
+change, everything cached (2:05).
+
+```
+| out:/trace-compass/plugins/org.eclipse.justj.openjdk.hotspot.jre.minimal.stripped.linux.x86_64_21.0.9.v20251105-0741/jre/lib/security/cacerts | keystore 146 certs: 23 not in cacert, 12 in cacert but not for TLS, 7 cacert TLS roots missing [no-password]; scanner: ECC G3 | keystore 118 certs == cacert [no-password] |
+jar signature blocks (META-INF/*.RSA|DSA|EC: code-signing certificate chains, not trust stores; not counted; listed in static/<side>/sigblocks.tsv):
+  before 37 files + 293 in archives
+  after 37 files + 293 in archives
+VERDICT tracecompass: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT tracecompass: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- What this proves: as for eclipse, the application does not run on the bundled JRE. The shipped
+  `tracecompass.ini` names the JustJ `bin/java` after `-vm`; the package's `postPatch` adds a second
+  `-vm` with nixpkgs' `jdk21` (the Eclipse launcher keeps the last value), the wrapper sets
+  `JAVA_HOME` to `jdk21`, and the JustJ JRE is not patchelf'd. So the run proves the bundled JRE's
+  store is wired to cacert, for anything that launches that JRE.
+- Shim (`shims/tracecompass.nix`): `bundled-jre.nix` with
+  `jre = "trace-compass/plugins/org.eclipse.justj.openjdk.*/jre"` and `loader = true` (the JRE is
+  unpatched). The package declares `cacert`: default injection. Every cell prints
+  `java.home=/nix/store/…-tracecompass-11.2.0/trace-compass/plugins/org.eclipse.justj.openjdk.hotspot.jre.minimal.stripped.linux.x86_64_21.0.9.v20251105-0741/jre`;
+  the refusing cells end in `PKIX path building failed`, after-test prints `OK status=200`.
+
+### tlaplus-toolbox (fix branch): static FIXED, behavioral PASS
+
+`--after e3b7063ba3640dd800b122295f7a776d8182c80a` (`cacert/tlaplus-toolbox`, "tlaplus-toolbox: generate
+the bundled JRE's cacerts from cacert"): the `installPhase` regenerates
+`libexec/toolbox/plugins/org.lamport.openjdk.*/jre/lib/security/cacerts` with `jre-generate-cacerts`
+and nixpkgs' `jdk_headless` keytool. The Toolbox 1.7.4 runs on this JRE (OpenJDK 14.0.1.7):
+`toolbox.ini` has `-vm plugins/org.lamport.openjdk.linux.x86_64_14.0.1.7/jre/bin/java`, and the package
+patchelfs that `java`. 10:54 in total (before built in 84 s, after in 240 s, the test-root toolbox in
+the matrix in 257 s, queue waits included; each build spends about a minute stripping). This run
+already had the signature-block change.
+
+```
+| out:/libexec/toolbox/plugins/org.lamport.openjdk.linux.x86_64_14.0.1.7/jre/lib/security/cacerts | keystore 93 certs: 45 not in cacert, 14 in cacert but not for TLS, 84 cacert TLS roots missing [no-password]; scanner: AAA | keystore 118 certs == cacert [no-password] |
+jar signature blocks (META-INF/*.RSA|DSA|EC: code-signing certificate chains, not trust stores; not counted; listed in static/<side>/sigblocks.tsv):
+  before 34 files + 228 in archives
+  after 34 files + 228 in archives
+VERDICT tlaplus-toolbox: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT tlaplus-toolbox: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- The before store is the 2020 root set of OpenJDK 14: 59 of its 93 roots are not trusted for TLS by
+  cacert (among them `AAA Certificate Services` and the expired AddTrust roots), and 84 of cacert's
+  118 TLS roots are missing from it. Since the Toolbox runs on this JRE, this is the store its own
+  HTTPS traffic used.
+- Shim (`shims/tlaplus-toolbox.nix`): `bundled-jre.nix` with
+  `jre = "libexec/toolbox/plugins/org.lamport.openjdk.*/jre"`, run directly (patched). The probe is
+  compiled with `--release 8`, so it runs on Java 14. The package declares `cacert`: default
+  injection. Every cell prints
+  `java.home=/nix/store/…-tlaplus-toolbox-1.7.4/libexec/toolbox/plugins/org.lamport.openjdk.linux.x86_64_14.0.1.7/jre`;
+  the refusing cells end in `SSLHandshakeException: PKIX path building failed`, after-test prints
+  `OK status=200 cipher=TLS_AES_256_GCM_SHA384`.
