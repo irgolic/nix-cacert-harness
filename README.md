@@ -123,7 +123,8 @@ lib/matrix.nix           the four cells as one attrset (one nixb queue slot)
 probes/TlsProbe.java     HTTPS probe for any JVM (compiled with --release 8)
 shims/                   per-package "make it do one HTTPS GET to $URL" snippets
 fixtures/                test root + leaf. The keys are public test material: never trust the root.
-fixes/                   overlays for --after-overlay (a NEGATIVE control; julia_*-bin without the install check)
+fixes/                   overlays for --after-overlay (a NEGATIVE control; julia_*-bin without the install check;
+                         julia_*-bin with cert.pem -> ca-bundle.crt, the trust-rules variant)
 out/<attr>/{static,behave}/   working files, scanner JSON, cell results (symlinks to store paths)
 logs/                    console output of the runs in RESULTS.md
 out-negative/, out-fallback/  working files of the negative-control and no-scanner runs
@@ -321,6 +322,10 @@ came back over a verified connection. The variables `$URL`, `$HOST`, `$PORT`, `$
     directory (it must match exactly one), with `loader = true` for a JRE the package leaves
     unpatched (it runs `bin/java` through nixpkgs' dynamic loader; the probe prints `java.home`,
     which stays the bundled JRE). Used by `eclipses.eclipse-java` and `tracecompass` (JustJ, through the loader) and `tlaplus-toolbox`.
+  - Julia, for `--shim` (RESULTS.md, "julia: trust-rules bundle"): `julia-libgit2` (a LibGit2 clone; the
+    refusal vs. a verified handshake is told apart by libgit2's error), and `julia-ssl-cert-file`,
+    `-trusted-only`, `-email-only-root` (all `shims/julia-env.nix`; use with `--sides before`), which
+    run the unmodified julia with `SSL_CERT_FILE` set to a bundle of the cell's cacert.
 
 Sketched, untested shim ideas for other families:
 - **PHP/composer apps**: `php -r` that `require`s the app's

@@ -567,6 +567,285 @@ VERDICT julia_110-bin: PASS: after-fix trust follows cacert; before-fix ignores 
   failures with OpenSSL-style backends) and `BADCERT_NOT_TRUSTED` (libcurl with mbedTLS) as
   refusals. This changes every cell's derivation, so cached cells run once more.
 
+### julia: trust-rules bundle (review question: can `cert.pem` point at `ca-bundle.crt`?)
+
+Run on 2026-10-22. **Question** (from review of the `cacert/julia-bin` fix, `05f45e387`): NetworkOptions.jl
+consults `SSL_CERT_FILE` and the system paths (`/etc/ssl/certs/ca-bundle.crt`, ...), which on NixOS are
+cacert's `ca-bundle.crt`, the variant WITH OpenSSL trust-rule blocks (`BEGIN TRUSTED CERTIFICATE`). So
+Julia must already read that format, and the fallback `share/julia/cert.pem` could link `ca-bundle.crt`
+instead of `ca-no-trust-rules-bundle.crt`?
+
+**Answer.** The conclusion holds: every stock-Julia consumer of `cert.pem` (Downloads/libcurl and
+LibGit2/libgit2) works with `ca-bundle.crt` on 1.13 and on 1.10, and trusts exactly cacert's TLS roots
+with it. The reasoning does not hold: only 1.13 (OpenSSL 3) reads the trust-rule format. 1.10 (mbedTLS
+2.28) cannot read it at all. It skips every `TRUSTED CERTIFICATE` block and works only because
+buildcatrust also writes a plain `BEGIN CERTIFICATE` copy of each TLS-trusted root. A bundle made of
+the TRUSTED blocks alone fails to load on 1.10 (matrix B2). Julia 1.10's own NetworkOptions says so
+(`OPENSSL_WARNING` below). Recommendation: keep `ca-no-trust-rules-bundle.crt` (see the end of this section).
+
+#### Source facts
+
+NetworkOptions `src/ca_roots.jl` as shipped in the cached outputs
+(`/nix/store/w6walp91…-julia-bin-1.13.2/share/julia/stdlib/v1.13/NetworkOptions`, NetworkOptions 1.3.0;
+`/nix/store/7kvj8pvg…-julia-bin-1.10.12/share/julia/stdlib/v1.10/NetworkOptions`, 1.2.0). The
+`LINUX_CA_ROOTS` list and `bundled_ca_roots()` are identical in both:
+
+```julia
+bundled_ca_roots() =
+    normpath(Sys.BINDIR::String, "..", "share", "julia", "cert.pem")
+
+const LINUX_CA_ROOTS = [
+    "/etc/ssl/cert.pem"                                 # Alpine Linux
+    "/etc/ssl/ca-bundle.pem"                            # OpenSUSE
+    "/etc/ssl/ca-certificates.pem"                      # OpenSUSE
+    "/etc/ssl/certs/ca-bundle.crt"                      # Debian/Ubuntu/Gentoo etc.
+    "/etc/ssl/certs/ca-certificates.crt"                # Debian/Ubuntu/Gentoo etc.
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" # CentOS/RHEL 7
+    "/etc/pki/tls/certs/ca-bundle.crt"                  # Fedora/RHEL 6
+    "/etc/pki/tls/certs/ca-certificates.crt"            # Fedora/RHEL 6
+    "/etc/pki/tls/cacert.pem"                           # OpenELEC
+]
+```
+
+The env-var order differs between the two versions. In both, a set variable is returned as is, without
+looking at the file:
+
+```julia
+# 1.13 (NetworkOptions 1.3.0)              # 1.10 (NetworkOptions 1.2.0)
+const CA_ROOTS_VARS = [                    const CA_ROOTS_VARS = [
+    "JULIA_SSL_CA_ROOTS_PATH"                  "JULIA_SSL_CA_ROOTS_PATH"
+    "SSL_CERT_FILE"                            "SSL_CERT_DIR"
+    "SSL_CERT_DIR"                             "SSL_CERT_FILE"
+]                                          ]
+```
+
+The system search differs too. 1.13 accepts a file on its first line of either PEM kind:
+
+```julia
+const system_ca_roots = OncePerProcess{String}() do
+    ...
+        for line in eachline(path)
+            if line in [BEGIN_CERT_REGULAR, BEGIN_CERT_OPENSSL]
+                return path
+```
+
+1.10 accepts a file only if it contains a *regular* `BEGIN CERTIFICATE` line. It skips a file that
+has only `BEGIN TRUSTED CERTIFICATE` blocks, warns, and falls back to `cert.pem`:
+
+```julia
+const OPENSSL_WARNING = """
+NetworkOptions could only find OpenSSL-specific TLS certificates which cannot be used by MbedTLS. ...
+...
+            for line in eachline(path)
+                if line == BEGIN_CERT_REGULAR
+                    SYSTEM_CA_ROOTS[] = path
+                    return # from lock()
+                elseif line == BEGIN_CERT_OPENSSL
+                    openssl_only = true
+```
+
+NixOS, `nixos/modules/security/ca.nix` at the base `8915027df`:
+
+```nix
+  caBundleName = if cfg.useCompatibleBundle then "ca-no-trust-rules-bundle.crt" else "ca-bundle.crt";
+  caBundle = "${cacertPackage}/etc/ssl/certs/${caBundleName}";
+...
+      # NixOS canonical location + Debian/Ubuntu/Arch/Gentoo compatibility.
+      environment.etc."ssl/certs/ca-certificates.crt".source = caBundle;
+
+      # Old NixOS compatibility.
+      environment.etc."ssl/certs/ca-bundle.crt".source = caBundle;
+
+      # CentOS/Fedora compatibility.
+      environment.etc."pki/tls/certs/ca-bundle.crt".source = caBundle;
+```
+
+The option text for `security.pki.useCompatibleBundle` (default false) says the trust-rules bundle
+"is known to be incompatible with certain software stacks". So by default both `/etc/ssl/certs`
+files are cacert's `ca-bundle.crt`. NixOS does **not** set `SSL_CERT_FILE` or `NIX_SSL_CERT_FILE`
+system-wide. `git grep` over `nixos/modules` at the base finds them only for individual services:
+matter-server, gitlab-runner, the qemu/vz VM host-cert copy, and `CURL_CA_BUNDLE` for nix-daemon.
+cacert's setup hook (`pkgs/by-name/ca/cacert/setup-hook.sh`) sets them in any nix-shell or build that
+has cacert as an input:
+
+```sh
+export NIX_SSL_CERT_FILE="${NIX_SSL_CERT_FILE:-@out@/etc/ssl/certs/ca-bundle.crt}"
+...
+export SSL_CERT_FILE=$NIX_SSL_CERT_FILE
+```
+
+On this NixOS host, the unmodified cached Julias under `env -i` (no network, only path resolution) give:
+
+```
+julia 1.13.2: ca_roots_path() = /etc/ssl/certs/ca-bundle.crt -> /nix/store/5rsl5ywm…-nss-cacert-3.126/etc/ssl/certs/ca-bundle.crt
+  TRUSTED blocks: 172, plain blocks: 118
+julia 1.10.12: ca_roots_path() = /etc/ssl/certs/ca-bundle.crt -> (same)
+```
+
+So the reviewer's premise is right: on NixOS, Julia already gets the trust-rules bundle today. The
+three `/etc/ssl/*.pem` entries ahead of it do not exist on NixOS.
+
+**cacert's `ca-bundle.crt` layout** (nss-cacert 3.131.1, `fprs4zi8…`; a one-off script split the blocks and took SHA-256
+fingerprints of the leading certificate TLV, as `lib/certset.py` does):
+- 118 plain blocks plus 169 TRUSTED blocks.
+- The 118 plain blocks are exactly the set in `ca-no-trust-rules-bundle.crt`.
+- Each of these TLS roots is written twice: the plain block, then a TRUSTED block with
+  `Trusted for: serverAuth`.
+- The other 51 roots appear **only** as TRUSTED blocks. Each is labelled `Traditional PEM block
+  omitted: this certificate is not trusted for authenticating servers.` 49 of them are trusted for
+  emailProtection only; 2 (Go Daddy Class 2 CA, Starfield Class 2 CA) carry neither OID.
+- The test-root cacert (`hv7n3g1z…`) has 119 plain and 170 TRUSTED blocks: the extra root gets both
+  forms (serverAuth, clientAuth, codeSigning).
+
+So a parser that skips TRUSTED blocks sees exactly the TLS set. A parser that honours them adds the
+51 roots only for their non-TLS purposes.
+
+**TLS backends in the binaries** (`readelf -d`, NEEDED):
+- 1.13.2: `libcurl.so` → `libssl.so.3 libcrypto.so.3`; `libgit2.so` (1.9.7) → `libssl.so.3 libcrypto.so.3`.
+- 1.10.12: `libcurl.so` → `libmbedtls.so.14 libmbedx509.so.1` (mbedTLS 2.28.10); `libgit2.so`
+  (1.6.4) → `libmbedtls.so.14 libmbedx509.so.1`.
+
+#### A. `cert.pem` -> `ca-bundle.crt` (the reviewer's variant), harness on the fix branch
+
+`fixes/julia-bin-trust-rules.nix`: on top of `05f45e387` it rewrites the fix's
+`ln -sf ${cacert}/etc/ssl/certs/ca-no-trust-rules-bundle.crt $out/share/julia/cert.pem` to
+`.../ca-bundle.crt` inside `installPhase`. Because the edit is a string replacement, the cacert path
+stays the one the package was called with, so `.override { cacert }` (the harness's injection) still
+reaches it; this was checked by evaluation. It keeps `doInstallCheck = false`.
+
+```
+CAH_REPO=/home/rafael/nixpkgs nix run path:$S/repo/nix-cacert-harness -- julia-bin \
+  --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after 05f45e387af5a700548a6dcfc1de4d6e8260eea5 \
+  --after-overlay fixes/julia-bin-trust-rules.nix          # and the same for julia_110-bin
+```
+
+```
+julia-bin:     | out:/share/julia/cert.pem | pem 121 certs: 3 not in cacert, ... | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+julia_110-bin: | out:/share/julia/cert.pem | pem 144 certs: 19 not in cacert, ... | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT (both): FIXED
+
+both:    | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT julia-bin: PASS          (224 s, after side built in 74 s)
+VERDICT julia_110-bin: PASS      (76 s)
+```
+
+After-cell logs (`shim.log`):
+- **1.13**:
+  - stock (`j28qvlfp…`): `cert.pem -> …fprs4zi8…/ca-bundle.crt`, `RequestError: SSL certificate
+    OpenSSL verify result: unable to get local issuer certificate (20)`.
+  - test (`lfyzga7b…`): `-> …hv7n3g1z…/ca-bundle.crt`, `status 200`.
+- **1.10**:
+  - stock (`6plr481m…`): `-> …fprs4zi8…/ca-bundle.crt`, `RequestError: Cert verify failed:
+    BADCERT_NOT_TRUSTED`.
+  - test (`g9q51wc3…`): `-> …hv7n3g1z…/ca-bundle.crt`, `status 200`.
+
+There is no mbedTLS load error: libcurl's mbedTLS backend loads the file, keeping only the plain blocks.
+
+#### B. Env-var path, unmodified cached julia-bin (what NixOS and nix-shell do today), no rebuild
+
+`shims/julia-env.nix` (via `shims/julia-ssl-cert-file*.nix`) runs the package's julia with
+`SSL_CERT_FILE` set to a bundle of the cell's own cacert (`$CACERT`: stock, or stock + test root).
+`--sides before` makes the package the base commit's julia-bin, i.e. the cached, unmodified
+`w6walp91…-julia-bin-1.13.2` and `7kvj8pvg…-julia-bin-1.10.12`. Injection is a NO-OP there, so only
+`SSL_CERT_FILE` differs between the two cells.
+
+```
+CAH_REPO=/home/rafael/nixpkgs nix run path:$S/repo/nix-cacert-harness#behave -- julia-bin \
+  --base 8915027df… --after 05f45e387… --sides before --shim julia-ssl-cert-file   # -trusted-only, -email-only-root
+```
+
+| `SSL_CERT_FILE` = | 1.13 stock | 1.13 + test root | 1.10 stock | 1.10 + test root |
+|---|---|---|---|---|
+| B1 `<cacert>/etc/ssl/certs/ca-bundle.crt` (118/119 plain + 169/170 TRUSTED) | REFUSED | CONNECTED | REFUSED | CONNECTED |
+| B2 only the TRUSTED blocks of it (0 plain) | REFUSED | CONNECTED | ERROR (load) | ERROR (load) |
+| B3 B1 + test root as a TRUSTED block for emailProtection only, no plain copy | REFUSED (`certificate rejected (28)`; harness shows ERROR) | CONNECTED (control) | REFUSED | CONNECTED (control) |
+
+Cell logs:
+- **B1**:
+  - 1.13 stock (`qz7xlg02…`): `unable to get local issuer certificate (20)`; test (`6g7vcl99…`): `status 200`.
+  - 1.10 stock (`j4l5y4vk…`): `Cert verify failed: BADCERT_NOT_TRUSTED`; test (`0inm37rr…`): `status 200`.
+  - This is the NixOS situation (same file, same julia), and it works on both versions.
+- **B2**:
+  - 1.13 (OpenSSL) reads TRUSTED blocks and honours their serverAuth trust (`czp90xgl…` REFUSED,
+    `772sp6d5…` CONNECTED).
+  - 1.10 (`ljzyschp…`, `9n4gxbm0…`) cannot load the file in either cell; the exact message is
+    `RequestError: Error reading ca cert file /build/trusted-only.crt - mbedTLS: (-0x2180) X509 - The CRT/CRL/CSR format is invalid, e.g. different type expected while requesting https://localhost:8443/`.
+  - -0x2180 is `MBEDTLS_ERR_X509_INVALID_FORMAT`. This matches mbedTLS's `mbedtls_x509_crt_parse`
+    (from memory of x509_crt.c, not re-read here): it searches for the literal
+    `-----BEGIN CERTIFICATE-----`, which a TRUSTED header does not contain. It skips TRUSTED blocks
+    when plain ones exist, and with none at all it tries DER and fails. So on 1.10 Julia does not
+    read the trust-rule format; it reads the plain copies next to it.
+- **B3** is the shape of cacert's 49 e-mail-only roots. Neither version trusts such a root for TLS.
+  - 1.13 (`p0fi7qxb…`): `RequestError: SSL certificate OpenSSL verify result: certificate rejected
+    (28)`. OpenSSL honours the trust rule (X509_V_ERR_CERT_REJECTED).
+  - 1.10 (`pcxb28dn…`): `BADCERT_NOT_TRUSTED`; mbedTLS ignores the block.
+  - The harness files the 1.13 cell as ERROR because its refusal regex in `lib/behave.nix` does not
+    know OpenSSL's `certificate rejected` wording. It was left unchanged, since changing it would
+    re-key every cell.
+  - Pointing `cert.pem` at `ca-bundle.crt` therefore does not widen TLS trust for Downloads on
+    either version.
+
+#### C. LibGit2 (optional part), `cert.pem` -> `ca-bundle.crt`
+
+`shims/julia-libgit2.nix`: `LibGit2.clone("https://localhost:8443/repo.git", …)` against the cell's
+`s_server -www`, which is not a git server.
+- A refused certificate surfaces through Julia's `certificate_callback` (`TLS host verification: the
+  identity of the server ...`) and then libgit2's `user rejected certificate for localhost`
+  (class HTTP, code ERROR).
+- A verified handshake ends in `invalid content-type: 'text/html'` from the HTTP layer, i.e. TLS
+  verification passed.
+
+Same base/after/overlay as A, `--shim julia-libgit2`:
+
+```
+both:    | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+VERDICT julia-bin: PASS (libgit2 1.9.7, OpenSSL)      VERDICT julia_110-bin: PASS (libgit2 1.6.4, mbedTLS)
+```
+
+The after-test cells (`1vgf66hb…`, `a1246g5b…`) print `ca_roots() = …/share/julia/cert.pem ->
+…hv7n3g1z…/ca-bundle.crt` and `invalid content-type: 'text/html'`. The first run of this shim filed
+the refusals as ERROR (it only knew GIT_ECERTIFICATE); the shim now also matches
+`rejected certificate`, and the table above is from the re-run.
+
+#### Consumers of `share/julia/cert.pem` in a stock Julia (both versions, grep of `share/julia/stdlib` and `base`)
+
+| consumer | how it gets the path | who parses the PEM | trust-rules bundle |
+|---|---|---|---|
+| Downloads.jl (and Pkg: `PlatformEngines.jl` calls `Downloads.request`/`download`) | `ca_roots_path()` → `CURLOPT_CAINFO` (`Curl/Easy.jl` `set_ca_roots_path`) | libcurl → OpenSSL 3 (1.13) / mbedTLS 2.28 (1.10) | works (A, B1); OpenSSL honours rules, mbedTLS skips TRUSTED blocks |
+| LibGit2 (and Pkg: `GitTools.jl` calls `LibGit2.clone`) | `LibGit2.initialize()`: `ca_roots()` → `git_libgit2_opts(SET_SSL_CERT_LOCATIONS)` | libgit2 → OpenSSL 3 (1.13) / mbedTLS (1.10) | works (C) |
+| `MozillaCACerts_jll.cacert`, `LibCURL.cacert` | hard-coded `normpath(Sys.BINDIR, DATAROOTDIR, "julia", "cert.pem")`; ignores `SSL_CERT_FILE` and `/etc` | nobody in stdlib (path only), for third-party code | whatever the third-party code uses |
+| `MbedTLS_jll`, `OpenSSL_jll`, `LibSSH2_jll` | stdlib JLLs are binary wrappers only; they do not read the path | n/a | n/a |
+
+No Julia code in `stdlib` or `base` parses PEM itself; the only `BEGIN ... CERTIFICATE` strings are in
+NetworkOptions' file sniffing quoted above. Outside the stdlib (not tested, and the two package
+lines are from memory of their sources, not checked here):
+- MbedTLS.jl hands the file to `mbedtls_x509_crt_parse_file`, which skips TRUSTED blocks, like 1.10's
+  libcurl.
+- OpenSSL.jl hands it to OpenSSL's loaders, which honour the rules.
+- A third-party consumer that parses PEM by itself would be the one to worry about. If it took
+  `TRUSTED CERTIFICATE` blocks as plain certificates, it would trust the 51 non-TLS roots for TLS;
+  if it rejected unknown blocks, it would fail outright. Upstream's `cert.pem` is curl's
+  `caextract` file, plain blocks only (121 in 1.13.2, 144 in 1.10.12, 0 TRUSTED), so that is the
+  format such code is written against.
+- `MozillaCACerts_jll.cacert` reaches that code even on NixOS, where `/etc/ssl` would otherwise win.
+- Julia 1.11 and 1.12 (`julia_111-bin`, `julia_112-bin`) were not run; the overlay covers them too.
+
+#### Recommendation
+
+Keep `ca-no-trust-rules-bundle.crt`, as on the fix branch. Linking `ca-bundle.crt` would work for
+every stock consumer on both versions (A, B1, C), and would not widen TLS trust for them (B3). But
+it buys nothing: both TLS stacks end up with the same 118 TLS roots either way. It also works on
+mbedTLS only through buildcatrust's plain-copy layout, not because Julia reads the format (B2).
+Meanwhile `cert.pem` is also handed unconditionally to third-party code via `MozillaCACerts_jll.cacert`
+and `LibCURL.cacert`, which upstream feeds a plain curl `cacert.pem`. The plain bundle is the
+like-for-like replacement. It is the same file `security.pki.useCompatibleBundle` selects, and the
+same one the other PEM fixes in this campaign link.
+
 ### rubyPackages.{excon,httpclient,nap,algoliasearch} (fix branch): static FIXED, behavioral PASS for all four
 
 All four fixes are one commit, `6f7ca0cd2` ("rubyPackages.{algoliasearch,excon,httpclient,nap}: use
