@@ -2092,6 +2092,7 @@ Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
 | eddie | `1ed46a6c3` | **no**: both sides fail in a dependency (PowerShell 7.0.0 nupkg, patchelf abort) | - | ~6.0 GB (fetches, failed builds) | INCOMPLETE | INCOMPLETE | skipped (GUI, no shim) |
 | gpac | `13307d886` | yes | 130 s | ~0.6 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (the default build has no TLS; see below) |
 | linphonePackages.liblinphone | `874cd910f` | yes | 285 s (and a python3 env) | ~0.35 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (no usable CLI; see below) |
+| supertuxkart | `86431c7a1` | yes | 388 s | ~1.5 GB (incl. the 0.8 GB base output fetched) | FIXED | FIXED: 14/14 → 0/14 | skipped (game) |
 
 ### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
 
@@ -2249,3 +2250,18 @@ VERDICT linphonePackages.liblinphone emudhra: FIXED: before accepted 14/14 compr
     is not used either.
   - A working shim would need a config file with TLS transports, or a scripted `linphone-daemon` session.
     That was not done. The attempt is not in the repository.
+
+### supertuxkart: static FIXED, eMudhra FIXED (14/14 → 0/14)
+
+`--after 86431c7a1b65ea05c2f0d1051571259b1214b681` (`cacert/supertuxkart`; `postInstall` replaces
+`share/supertuxkart/data/cacert.pem` with a symlink to cacert's `ca-bundle.crt`, on every platform now, not
+only Darwin). The after side was built in 388 s; the base output (821 MiB unpacked) was fetched from the cache.
+Free space dropped by ~1.5 GB at the peak, the fetch included. The run took 9:08. A game, so no live shim.
+
+```
+| out:/share/supertuxkart/data/cacert.pem | pem 127 certs: 39 not in cacert, 17 in cacert but not for TLS, 47 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT supertuxkart: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+| out:/share/supertuxkart/data/cacert.pem | pem: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT supertuxkart emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+```
