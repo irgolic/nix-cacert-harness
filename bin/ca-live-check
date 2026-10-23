@@ -105,10 +105,11 @@ hide=()
 if (( nosys )); then
   bw=$(cah_realise -f "$before_src" bubblewrap 2>"$W/bwrap.log" | tail -1)
   [[ -x $bw/bin/bwrap ]] || die "--no-system-store: could not build bubblewrap (see $W/bwrap.log)"
-  for d in /etc/ssl /etc/pki; do [[ -d $d ]] && hide+=(--tmpfs "$d"); done
+  hidden=()
+  for d in /etc/ssl /etc/pki; do [[ -d $d ]] && { hide+=(--tmpfs "$d"); hidden+=("$d"); }; done
   "$bw/bin/bwrap" --dev-bind / / "${hide[@]}" -- true 2>"$W/bwrap.err" \
     || die "--no-system-store: bwrap does not work here (unprivileged user namespaces?): $(head -1 "$W/bwrap.err")"
-  echo "system store: HIDDEN (--no-system-store: empty tmpfs over ${hide[*]//--tmpfs /}, network unchanged)"
+  echo "system store: HIDDEN (--no-system-store: empty tmpfs over ${hidden[*]}, network unchanged)"
 fi
 sys_stores=()
 for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
@@ -118,7 +119,7 @@ done
 # --- controls: one handshake (and one GET) per host -------------------------------------------------
 cacert_out=$(cah_realise "${AFTER[@]}" 'cacert^out' 2>"$W/cacert.log" | head -1)
 [[ -d $cacert_out/etc/ssl/certs ]] || die "could not build the after side's cacert (see $W/cacert.log)"
-declare -A CTL=()
+declare -A CTL=() VETO=()
 ok_hosts=()
 for h in "${H[@]}"; do
   fq=$h$EM_SUFFIX d=$W/control-$h fx=$CAH_EMUDHRA_DIR/$h$EM_SUFFIX.pem
@@ -146,15 +147,19 @@ for h in "${H[@]}"; do
       -untrusted "$d/served.pem" "$d/served.pem" >/dev/null 2>&1 && stock="ACCEPTS (via $b)"
   done
   if [[ $stock != rejects ]]; then CTL[$h]="STOCK CACERT $stock the served chain"; continue; fi
-  sys=""
+  sys="" veto=""
   if (( ! nosys )); then
     for f in "${sys_stores[@]}"; do
-      openssl verify -purpose sslserver -no-CApath -no-CAstore -CAfile "$f" -untrusted "$d/served.pem" "$d/served.pem" \
-        >/dev/null 2>&1 && sys="$sys ${f}"
+      if openssl verify -purpose sslserver -no-CApath -no-CAstore -CAfile "$f" -untrusted "$d/served.pem" "$d/served.pem" \
+           > "$d/system-store.log" 2>&1; then sys="$sys ${f}"
+      # error 28, X509_V_ERR_CERT_REJECTED: the store holds the root with a trust rule that rejects it
+      elif grep -q '^error 28 ' "$d/system-store.log"; then veto="$veto ${f}"
+      fi
     done
   fi
   CTL[$h]="ok: HTTP ${status:-?}, served chain == fixtures/emudhra/${fx##*/} ($nserved certs, valid for the host up to $top_issuer), stock cacert rejects it"
   [[ -n $sys ]] && CTL[$h]="${CTL[$h]}; WARNING: the host's system store ACCEPTS it:$sys"
+  [[ -n $veto ]] && VETO[$h]=1
   ok_hosts+=("$h")
 done
 if (( ! nosys )); then
@@ -162,6 +167,12 @@ if (( ! nosys )); then
     acc=$(for h in "${ok_hosts[@]}"; do [[ ${CTL[$h]} == *WARNING* ]] && echo "$h"; done | paste -sd,)
     echo "system store: visible: $(for f in "${sys_stores[@]}"; do printf '%s -> %s ' "$f" "$(readlink -f "$f" | sed 's|^/nix/store/[a-z0-9]\{32\}-||')"; done)"
     echo "              ${acc:+ACCEPTS the served chain of $acc: a CONNECTED there may come from it, not from the package}${acc:-rejects every served chain, so it cannot make a cell CONNECTED}"
+    vetoed=$(for h in "${ok_hosts[@]}"; do [[ -n ${VETO[$h]:-} ]] && echo "$h"; done | paste -sd,)
+    if [[ -n $vetoed ]]; then
+      echo "              but it holds the root of $vetoed with a trust rule that REJECTS it (OpenSSL \"certificate rejected\"):"
+      echo "              a program that loads it next to its own store (OpenSSL's default paths, e.g. excon) is"
+      echo "              REFUSED there whatever its own store says; --no-system-store shows the package's store alone"
+    fi
   else
     echo "system store: none found in /etc/ssl or /etc/pki"
   fi
@@ -189,7 +200,13 @@ for side in $sides; do
     fi
     RES[$side-$h]=$r
     # evidence: the refusal itself (a Java stack trace ends in "... N more"), else the last line
-    if [[ $r == REFUSED ]]; then ex=$(grep -Ei -m1 "$CAH_REFUSAL_RE" "$d/shim.log")
+    if [[ $r == REFUSED ]]; then
+      ex=$(grep -Ei -m1 "$CAH_REFUSAL_RE" "$d/shim.log")
+      shopt -s nocasematch
+      if [[ $ex =~ ($CAH_REFUSAL_RE) ]]; then   # keep the match in view: 70 chars before it at most
+        pre=${ex%%"${BASH_REMATCH[0]}"*}; (( ${#pre} > 70 )) && ex="...${ex:${#pre}-70}"
+      fi
+      shopt -u nocasematch
     else ex=$(grep -v '^[[:space:]]*$' "$d/shim.log" | tail -1); fi
     printf '  %-6s %-11s %-14s | %s\n' "$side" "$h" "$r" "$(sed 's/^[[:space:]]*//' <<<"$ex" | cut -c1-160)"
     [[ $side == after && $r == CONNECTED ]] && redflag+=("$h")
@@ -231,6 +248,9 @@ elif (( b_conn )); then
   verdict="PASS: before CONNECTED to $b_conn/$nh host(s) serving a compromised eMudhra chain ($b_conn_n); after REFUSED on all $nh$note"
 elif (( b_ref == nh )); then
   verdict="INCONCLUSIVE-BEFORE: before was REFUSED on all $nh host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all $nh$note"
+  if (( ! nosys )) && [[ -n ${vetoed:-} ]]; then
+    verdict="$verdict. The host's system store, visible here, distrusts the roots of $vetoed: rerun with --no-system-store if the program also loads it"
+  fi
 else
   verdict="INCONCLUSIVE-BEFORE: before did not connect anywhere (some cells ERROR, see $W/before-<host>/shim.log); after REFUSED on all $nh$note"
 fi

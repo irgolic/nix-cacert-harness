@@ -450,6 +450,13 @@ bin/ca-live-check [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--
   default paths to its own store (excon) reads them too.
   - The control checks each served chain against these stores and prints whether they accept it. If
     one does, a `CONNECTED` there may come from it, not from the package.
+  - The system store can also turn a cell into `REFUSED`. A trust-rules bundle can hold a root with a
+    rule that *rejects* it. This machine's NixOS bundle (nss-cacert 3.126) rejects emSign ECC Root CA -
+    G3 and AAA Certificate Services for every use. A program that loads that bundle before its own file
+    is then refused (`certificate rejected`, error 28) whatever its own store says: excon does, through
+    `set_default_paths`.
+  - The control reports such a veto, and an `INCONCLUSIVE-BEFORE` verdict then points at
+    `--no-system-store` (see RESULTS.md, rubyPackages.excon).
   - `--no-system-store` puts an empty tmpfs over `/etc/ssl` and `/etc/pki`, using `bwrap` from the
     base nixpkgs; the network is unchanged. This is for programs that read the system store
     *instead of* their own when it exists. Julia's `NetworkOptions.ca_roots_path()` does: it prefers

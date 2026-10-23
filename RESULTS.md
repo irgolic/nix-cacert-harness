@@ -1727,3 +1727,265 @@ VERDICT jabref: PASS: after-fix trust follows cacert; before-fix ignores it
   cipher=TLS_AES_256_GCM_SHA384`.
 - Existing users keep their already-seeded `~/.local/share/jabref/ssl/truststore.jks`. JabRef only
   copies the resource when the file is missing.
+
+## eMudhra chains: offline (`--emudhra`) and live hosts (`ca-live-check`) (2026-10-23)
+
+Twelve fix branches checked against the certificates of the incident itself
+(<https://emudhra.we-have-a-problem.com/>) instead of the synthetic test root. Each was run from `/` with
+the local flake, one package at a time:
+`CAH_REPO=/home/rafael/nixpkgs nix run path:. -- <attr> --emudhra --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after <cacert/<branch> head>`.
+Cleaned outputs: `runs/live-<attr>.txt` in the gist.
+
+- `[1/2]`: the static check, plus every store verified offline against the 14 chains in `fixtures/emudhra`.
+- `[2/2]`: the live check. The package's shim ran outside the sandbox against `dv-g3b`, `dv-g3b-aaa`,
+  `dv-g3c` and `dv-g3c-aaa`, with one control handshake per host, then one request per host per side.
+- The static tables and main VERDICT lines are the usual ones (in the gist outputs). All twelve main
+  verdicts are FIXED, four of them with the archive qualifier. Only the eMudhra table and the two new
+  VERDICT lines are shown here.
+- Every control passed on every run. Each host answered HTTP 200, served exactly the fixture chain (3
+  certificates up to emSign ECC Root CA - G3, or 2 up to AAA Certificate Services) and is valid for its
+  name, and the after side's cacert 3.131.1 rejects it.
+- **No after side connected to any host. There are no red flags.**
+
+Harness versions. httplib2, temurin-jre-bin and zulu ran at `8b6ecd9`. The rest ran with the two changes
+of `ce380f4` already in the working tree: the refusal excerpt from h2o on, and `certificate rejected` as a
+refusal from bazarr on. h2o and invoiceplane were rerun at `ce380f4`, see below.
+
+| attr | `--after` | offline, before → after | live before (g3b, g3b-aaa, g3c, g3c-aaa) | live after | live verdict | time |
+|---|---|---|---|---|---|---|
+| python3Packages.httplib2 | `8e60aed8f` | 7/14 (aaa) → 0/14 | REF, **CONN**, REF, **CONN** | all REFUSED | PASS | 0:41 |
+| temurin-jre-bin | `f2957b081` | 7/14 (g3) → 0/14 | **CONN**, REF, **CONN**, REF | all REFUSED | PASS | 1:25 |
+| zulu | `685723a7d` | 14/14 → 0/14 | **CONN** ×4 | all REFUSED | PASS | 3:10 |
+| h2o | `de654520a` | 14/14 → 0/14 | **CONN** ×4 | all REFUSED | PASS (rerun) | 2:06 |
+| python3Packages.raven | `d1ba4d092` | 7/14 (aaa) → 0/14 | REFUSED ×4 | all REFUSED | INCONCLUSIVE-BEFORE (no SNI) | 1:28 |
+| gam | `a4e862f94` | 0/14 → 0/14 | REFUSED ×4 | all REFUSED | INCONCLUSIVE-BEFORE (expected) | 0:54 |
+| invoiceplane | `7d24deaf5` | 14/14 → 0/14 | **CONN** ×4 | all REFUSED | PASS (rerun) | 2:18 |
+| bazarr | `9d9ab6b9b` | 7/14 (g3) → 0/14 | **CONN**, REF, **CONN**, REF | all REFUSED | PASS | 3:58 |
+| rubyPackages.excon | `455bac554` | 7/14 (g3) → 0/14 | **CONN**, REF, **CONN**, REF | all REFUSED | PASS with `--no-system-store` | 0:31 |
+| julia-bin | `96a7df638` + `fixes/julia-bin-skip-installcheck.nix` | 7/14 (g3) → 0/14 | **CONN**, REF, **CONN**, REF | all REFUSED | PASS with `--no-system-store` | 0:48 |
+| olvid (control) | `886fb4aa0` | 14/14 → store removed | REFUSED ×4 | all REFUSED | INCONCLUSIVE-BEFORE (expected) | 1:07 |
+| frostwire-bin (control) | `0e9b68bb8` | 14/14 → store removed | REFUSED ×4 | all REFUSED | INCONCLUSIVE-BEFORE (expected) | 0:46 |
+
+Where the before side connected, it connected exactly to the hosts whose root the offline check found in
+the before store: `aaa` only for httplib2, `g3` only for temurin, bazarr, excon and julia, and both for
+zulu, h2o and invoiceplane. The two checks agree.
+
+Notes per package:
+
+- **httplib2, raven: the `dist` wheels.** The branch heads now make the symlink in `postFixup`, not in
+  `postPatch` as in the earlier httplib2 runs above. The wheel in the `dist` output therefore still
+  carries the vendored bundle, and that bundle accepts the 7 AAA chains. The emudhra verdict says so
+  ("+ after-side archive members accept 7/14"), as the main verdict does for archives. The installed
+  package uses the symlink. gam's wheel bundle accepts none.
+- **raven: INCONCLUSIVE-BEFORE because raven sends no SNI.** The before store does trust AAA (7/14
+  offline). raven's `ValidHTTPSConnection.connect` calls
+  `ssl.wrap_socket(sock, ca_certs=..., cert_reqs=CERT_REQUIRED)` without a server name, and the shim's
+  stand-in for that removed stdlib function does the same. Without SNI, every test host presents its
+  default chain, `dv-g3b`'s (checked with one `openssl s_client -noservername` handshake: leaf
+  `CN=dv-g3b-emudhra...`, up to emSign ECC Root CA - G3). raven's store lacks that root.
+  - So all four cells of both sides are G3 handshakes. Before refuses them for lack of G3, after
+    refuses them as well.
+  - A non-virtual-hosted server with an AAA chain would have been accepted before; the offline check is
+    the evidence for that.
+- **gam: expected.** The vendored `gam/cacerts.pem` (26 certificates, Google's own selection) holds
+  neither root, so the offline check says NOT AFFECTED and nothing connects.
+- **h2o and invoiceplane: rerun.** In the first runs (`runs-raw`, not in the gist) the after side's
+  `-aaa` cells were ERROR, not REFUSED: `h2o-httpclient: certificate rejected` and stripe-php's
+  `OpenSSL verify result: certificate rejected (28)`.
+  - That is OpenSSL's X509_V_ERR_CERT_REJECTED. cacert's `ca-bundle.crt` holds AAA Certificate Services
+    with an e-mail-only trust rule, so OpenSSL refuses it for TLS with this error.
+  - The behavioral regex never needed the string, because its test root carries no trust rules.
+    `ce380f4` adds it to ca-live-check's regex only; `lib/behave.nix` is unchanged.
+  - Rerun at `ce380f4`: PASS for both.
+- **excon: the host's system store vetoed the before side; PASS with `--no-system-store`.**
+  - The first run, with the system store visible (`runs/live-rubyPackages.excon-system-store-visible.txt`),
+    was REFUSED on all 8 cells, i.e. INCONCLUSIVE-BEFORE.
+  - Excon builds its store with `set_default_paths` and then adds its `data/cacert.pem`. Outside the
+    sandbox, the default path is this machine's `/etc/ssl/certs/ca-certificates.crt` (NixOS,
+    nss-cacert 3.126, a trust-rules bundle).
+  - That bundle lists emSign ECC Root CA - G3 and AAA Certificate Services with every use *rejected*,
+    and OpenSSL lets that rule win over the plain copy from excon's file. Before was therefore refused
+    with `certificate verify failed (certificate rejected)`.
+  - Checked offline with the G3 chain: `-CAfile excon/cacert.pem` gives OK, the host bundle followed by
+    excon's file gives `error 28 ... certificate rejected`.
+  - The rerun with `--no-system-store` (empty tmpfs over `/etc/ssl` and `/etc/pki` via bwrap, network
+    unchanged) is the table below: before connects through G3, after refuses.
+  - The control now reports such a veto, and an INCONCLUSIVE-BEFORE verdict points at
+    `--no-system-store`. This was tested on `dv-g3b` alone.
+- **julia-bin: run with `--no-system-store` from the start.** `NetworkOptions.ca_roots_path()` prefers
+  `/etc/ssl/certs/ca-certificates.crt` (and the `/etc/pki` bundle) over the bundled
+  `share/julia/cert.pem` when one exists. With the host store visible, Julia would have tested the
+  host's store, not the package's.
+  - The after side used the overlay of the earlier julia runs. The live wrapper imports the side's
+    nixpkgs with it, so `--after-overlay` works unchanged.
+  - Before connected through G3 with the bundled `cert.pem`. After refused: `unable to get local issuer
+    certificate` for G3, `certificate rejected (28)` for AAA.
+- **olvid and frostwire-bin: the expected INCONCLUSIVE-BEFORE controls.** Their before outputs ship a
+  keystore that accepts all 14 chains offline: the bundled runtime's `lib/security/cacerts`, and
+  `share/java/jre/lib/security/cacerts` respectively.
+  - Neither program runs on that runtime. `bin/olvid` execs nixpkgs' `openjdk-21.0.12.1+1/bin/java`, and
+    frostwire's launcher sets `JAVA_PROGRAM_DIR` to the same openjdk. That openjdk uses cacert at the
+    base (#576518).
+  - So the live check refuses everywhere on both sides.
+  - Live-only shims: `shims/live/olvid.nix` (takes the `java` path from the binary wrapper) and
+    `shims/live/frostwire-bin.nix` (takes `JAVA_PROGRAM_DIR` from the launcher). Both run TlsProbe on
+    that JVM.
+  - frostwire-bin's branch head `0e9b68bb8` is rebased onto `9ced70b05` (master of 2026-10-23), so its
+    after side is a newer nixpkgs. The build was already in the store.
+- The `-noct-` hosts were not contacted. Their chains are in the offline check (the `noct` counts).
+
+Per package, the eMudhra table, its VERDICT line, the live table and its VERDICT line:
+
+#### python3Packages.httplib2
+
+```
+| out:/lib/python3.14/site-packages/httplib2/cacerts.txt | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+inside archives (zip members, extracted):
+| dist:/httplib2-0.32.0-py3-none-any.whl!httplib2/cacerts.txt | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) |
+VERDICT python3Packages.httplib2 emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2); after 0/14 (+ after-side archive members accept 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2), see table)
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | CONNECTED      | REFUSED        | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT python3Packages.httplib2 live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b-aaa,dv-g3c-aaa); after REFUSED on all 4
+```
+
+#### temurin-jre-bin
+
+```
+| out:/lib/security/cacerts | keystore: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | keystore: accepted 0/14 |
+VERDICT temurin-jre-bin emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT temurin-jre-bin live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
+
+#### zulu
+
+```
+| out:/lib/security/cacerts | keystore: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | keystore: accepted 0/14 |
+VERDICT zulu emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | CONNECTED      | CONNECTED      | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT zulu live: PASS: before CONNECTED to 4/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa); after REFUSED on all 4
+```
+
+#### h2o (rerun at `ce380f4`)
+
+```
+| out:/share/h2o/ca-bundle.crt | pem: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT h2o emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | CONNECTED      | CONNECTED      | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT h2o live: PASS: before CONNECTED to 4/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa); after REFUSED on all 4
+```
+
+#### python3Packages.raven
+
+```
+| out:/lib/python3.14/site-packages/raven/data/cacert.pem | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+inside archives (zip members, extracted):
+| dist:/raven-6.10.0-py2.py3-none-any.whl!raven/data/cacert.pem | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) |
+VERDICT python3Packages.raven emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2); after 0/14 (+ after-side archive members accept 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2), see table)
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT python3Packages.raven live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
+```
+
+#### gam
+
+```
+| out:/lib/python3.14/site-packages/gam/cacerts.pem | pem: accepted 0/14 | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+inside archives (zip members, extracted):
+| dist:/gam7-7.43.4-py3-none-any.whl!gam/cacerts.pem | pem: accepted 0/14 | pem: accepted 0/14 |
+VERDICT gam emudhra: NOT AFFECTED: no store on either side accepts any of the 14 chains (before 0/14, after 0/14)
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT gam live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
+```
+
+#### invoiceplane (rerun at `ce380f4`)
+
+```
+| out:/application/config/cacert.pem | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+| out:/vendor/stripe/stripe-php/data/ca-certificates.crt | pem: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT invoiceplane emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | CONNECTED      | CONNECTED      | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT invoiceplane live: PASS: before CONNECTED to 4/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa); after REFUSED on all 4
+```
+
+#### bazarr
+
+```
+| out:/lib/bazarr/libs/certifi/cacert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT bazarr emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT bazarr live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
+
+#### rubyPackages.excon (`--no-system-store`)
+
+```
+| out:/lib/ruby/gems/3.4.0/gems/excon-1.3.1/data/cacert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT rubyPackages.excon emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT rubyPackages.excon live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
+
+#### julia-bin (`--after-overlay fixes/julia-bin-skip-installcheck.nix --no-system-store`)
+
+```
+| out:/share/julia/cert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT julia-bin emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT julia-bin live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
+
+#### olvid
+
+```
+| out:/lib/security/cacerts | keystore: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | absent |
+inside archives (zip members, extracted):
+| out:/share/olvid/webrtc-java-0.14.0-linux-x86_64.jar!libwebrtc-java-linux-x86_64.so | n/a (pem: no certificates readable) | n/a (pem: no certificates readable) |
+VERDICT olvid emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT olvid live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
+```
+
+#### frostwire-bin
+
+```
+| out:/share/java/jre/lib/security/cacerts | keystore: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | absent |
+VERDICT frostwire-bin emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT frostwire-bin live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
+```
+
