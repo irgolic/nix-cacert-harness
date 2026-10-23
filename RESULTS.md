@@ -2405,12 +2405,14 @@ The fix: `postInstall` replaces `lib/pgsql-tools/_internal/certifi/cacert.pem` (
 upstream binary release) with a symlink to cacert's `ca-bundle.crt`. The rebuild is unpack, copy and
 autoPatchelf only.
 
-- A scan of the PYZ archive (`PyInstaller.archive.readers`) finds the `certifi` users: `requests` (so
-  `azure-core`/`azure-identity`/`msal`, the Entra ID token requests), `httpx`/`httpcore` (`openai` under
-  `semantic-kernel`) and `httplib2`. There is no `pyi_rth_certifi` runtime hook, so `SSL_CERT_FILE` is not set
+- A scan of the PYZ archive (`PyInstaller.archive.readers`) finds the `certifi` users: `requests`, `httpx`/`httpcore`
+  and `httplib2`. The service's own HTTPS calls are its Azure clients (`azure-mgmt-monitor`,
+  `azure-mgmt-postgresqlflexibleservers`; sync, so `azure-core`'s `RequestsTransport`, i.e. `requests`), with a
+  static token that the VS Code extension supplies (`fetch_azure_token_request`). Chat completions go back to
+  the extension over JSON-RPC (`vscode_chat_completion`). There is no `pyi_rth_certifi` runtime hook, so `SSL_CERT_FILE` is not set
   from it. PostgreSQL connections themselves use libpq's `sslrootcert`, not this file.
 - No live shim: the program is a JSON-RPC service for the VS Code PostgreSQL extension, its HTTPS calls go to
-  fixed Microsoft endpoints after a sign-in, and a PyInstaller binary cannot run a snippet. Also,
+  Azure with a token from the extension, and a PyInstaller binary cannot run a snippet. Also,
   `ossdbtoolsservice_main --help` exits with SIGSEGV on this machine, before and after the change alike.
 
 ```
