@@ -173,7 +173,7 @@ with zipfile.ZipFile(sys.argv[1]) as z, z.open(sys.argv[2]) as s, open(sys.argv[
 
 # Uses the loop variables of the main check: attr, W, STATUS, cands.
 emudhra_report() {
-  local o rel side p cells rows=() arows=() total ev sb sa nb na nab rest unchk_b=0 unchk_a=0 a m
+  local o rel side p cells rows=() arows=() total ev sb sa nb na nab rest unchk_b=0 unchk_a=0 a m em
   total=$(em_names | grep -c .)
   for side in before after; do : > "$W/$side/emudhra-accepted"; : > "$W/$side/emudhra-accepted-archives"; done
   while IFS=$'\t' read -r o rel; do
@@ -201,10 +201,13 @@ emudhra_report() {
       p=$(jq -r --arg o "$o" '.[$o] // empty' "$W/$side/outs.json" 2>/dev/null)
       a=${rel%%!*} m=${rel#*!}
       if [[ $m == *'!'* ]]; then cells+=("n/a (nested archive)"); continue; fi
-      if ! em_member "$(readlink -f "$p")$a" "$m" "$W/$side/em-member"; then cells+=("n/a (not a zip member)"); continue; fi
-      em_cell "$W/$side/em-member" "$W/$side" "$W/$side/emudhra-accepted-archives"
+      # Keep the member's file name: is_keystore only takes a PKCS12 (DER) file for a keystore when
+      # its name says so (truststore.jks, cacerts, ...).
+      em=$W/$side/em-member-${m##*/}
+      if ! em_member "$(readlink -f "$p")$a" "$m" "$em"; then rm -f "$em"; cells+=("n/a (not a zip member)"); continue; fi
+      em_cell "$em" "$W/$side" "$W/$side/emudhra-accepted-archives"
       cells+=("$EM_DESC")
-      rm -f "$W/$side/em-member"
+      rm -f "$em"
     done
     arows+=("| $o:$rel | ${cells[0]} | ${cells[1]} |")
   done < <(cut -f1,2 "$W"/before/findings.tsv "$W"/after/findings.tsv 2>/dev/null | grep '!' | sort -u)
