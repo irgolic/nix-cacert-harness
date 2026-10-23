@@ -424,7 +424,12 @@ bin/ca-live-check [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--
   `NIX_SSL_CERT_FILE` or `SSL_CERT_DIR`, and `HOME` and `TMPDIR` in a fresh directory. The package's own
   store decides.
 - Results: `CONNECTED` (the shim exited 0), `REFUSED` (a certificate-verification error, with the same
-  regex as `lib/behave.nix`), or `ERROR` (anything else, including the timeout).
+  regex as `lib/behave.nix`, plus OpenSSL's `certificate rejected`), or `ERROR` (anything else,
+  including the timeout).
+  - `certificate rejected` is what a trust-rules bundle gives for a root it holds but does not trust
+    for TLS: cacert's `ca-bundle.crt` and AAA Certificate Services. `h2o-httpclient` prints only
+    that string.
+  - The sandboxed test root has no trust rules, so the behavioral matrix never sees this error.
 - **Hosts.** The default is `dv-g3b`, `dv-g3b-aaa` (via the AAA cross-sign), `dv-g3c` and `dv-g3c-aaa`.
   The `-noct-` hosts are skipped by default: their leaves carry no SCTs, so CT-enforcing clients (the
   browsers) reject them whatever their trust store says. None of the clients tested here enforce CT,

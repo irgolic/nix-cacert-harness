@@ -262,6 +262,9 @@ em_store() {
   fi
 }
 
-# Certificate-verification failures in a shim's output; anything else is ERROR, not REFUSED.
-# Keep in sync with the grep in lib/behave.nix (not shared, so the behavioral cells stay cached).
-CAH_REFUSAL_RE='certificate verify failed|CERTIFICATE_VERIFY_FAILED|unable to get local issuer|PKIX path|unable to find valid certification path|self[- ]signed certificate|unknown ca|certificate (is )?not trusted|untrusted|SSLHandshakeException|server certificate verification failed|x509: certificate signed by unknown authority|SSL certificate problem|BADCERT_NOT_TRUSTED'
+# Certificate-verification failures in a shim's output (ca-live-check); anything else is ERROR, not
+# REFUSED. The grep of lib/behave.nix (not shared, so the behavioral cells stay cached), plus
+# "certificate rejected": OpenSSL's X509_V_ERR_CERT_REJECTED, what a trust-rules bundle (cacert's
+# ca-bundle.crt) gives for a root it holds but does not trust for TLS (AAA Certificate Services).
+# h2o-httpclient prints only that string. The sandboxed test root never has trust rules.
+CAH_REFUSAL_RE='certificate rejected|certificate verify failed|CERTIFICATE_VERIFY_FAILED|unable to get local issuer|PKIX path|unable to find valid certification path|self[- ]signed certificate|unknown ca|certificate (is )?not trusted|untrusted|SSLHandshakeException|server certificate verification failed|x509: certificate signed by unknown authority|SSL certificate problem|BADCERT_NOT_TRUSTED'
