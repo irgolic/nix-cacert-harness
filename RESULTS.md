@@ -1630,6 +1630,10 @@ Cleaned outputs: `runs/<attr>.txt` in the gist.
 
 ### jabref (fix branch): static FIXED, behavioral PASS, on out-of-sandbox builds (the nix daemon here cannot build it)
 
+**Update (2026-10-23, later):** the daemon's build dir is now on disk, and jabref has been built in the sandbox and
+rerun without the stand-in: static FIXED, behavioral PASS, eMudhra FIXED, live PASS. See "Sandboxed builds of the
+remaining fix branches" at the end of this file. The stand-in run below is kept as history (`runs/jabref-oob-standin.txt`).
+
 `--after bc5739d29840b1a625dbe557acfb1a512737ebee` (`cacert/jabref`, "jabref: generate truststore.jks from
 cacert"). `postPatch` replaces `jablib/src/main/resources/ssl/truststore.jks` with the output of
 `jre-generate-cacerts ${jdk}/bin/keytool ${cacert}/etc/ssl/certs/ca-bundle.crt` (jdk25, the build JDK)
@@ -1785,6 +1789,9 @@ VERDICT jetbrains.jdk-no-jcef: PASS: after-fix trust follows cacert; before-fix 
 - Space: the build-dir tmpfs (see jabref above) was enough for one JBR build at a time, not two.
 
 ### jetbrains.jdk (with JCEF, fix branch): not built here, the build dir is too small
+
+**Update (2026-10-23, later):** built in the sandbox once the build dir moved to disk (14:54, about 8.3 GB peak);
+see "Sandboxed builds of the remaining fix branches" at the end of this file.
 
 Dry-run: one derivation to build (`jetbrains-jdk-jcef-25.0.3-b508.4.drv`), with `jcef-jetbrains-1207`
 (290 MiB download, 640 MiB unpacked) and thrift fetched; the base output is on cache.nixos.org. Since
@@ -2058,3 +2065,100 @@ before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
 after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
 VERDICT frostwire-bin live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
 ```
+
+## Sandboxed builds of the remaining fix branches (2026-10-23, build dir on disk)
+
+The nix daemon's build directory is now a bind mount of `/dev/vda` at `/nix/var/nix/builds` (336 GB
+free at the start), so the fix branches that this machine could not build before were built in the
+sandbox, one at a time, through `nixb` (4 cores, `--max-jobs 1`). Each ran from `/` with the local flake:
+`CAH_REPO=/home/rafael/nixpkgs nix run path:. -- <attr> --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after <cacert/<branch> head> --emudhra --force-build`.
+Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
+
+- **Build time** is the harness's own "after ok (N built, Ts)" figure: the after-side build, fetches of
+  its inputs included.
+- **Peak build-dir use** is the largest drop in free space on `/dev/vda` during the run, sampled every
+  5 s. The per-build directories (`/nix/var/nix/builds/nix-<pid>-<n>`) are root-owned with mode 0700,
+  so `du` can't read them. The number therefore includes the output written to the store and any
+  concurrent writes by other agents to the same disk, so it is an upper bound.
+- The two harness fixes these runs led to: `f5cd6d1` (an archive member keeps its file name when
+  extracted, so a PKCS12 `truststore.jks` inside a jar is read as a keystore, not as "n/a (pem)") and
+  `b9ec43b` (a file with a PEM header but no parseable certificate, e.g. JCEF's `libcef.so`, is "n/a" and
+  counted as not checkable, instead of "pem: accepted 0/14").
+
+| attr | `--after` | built | build time | peak build dir | static | eMudhra offline | live |
+|---|---|---|---|---|---|---|---|
+| jabref | `bc5739d29` | yes | 250 s (+ 261 s for the test-root build) | ~12.6 GB (test-root build ~10.6 GB) | FIXED (+ archives) | FIXED: 7/14 (aaa) → 0/14 | PASS (before CONN g3b-aaa, g3c-aaa) |
+| jetbrains.jdk (JCEF) | `34f61387b` | yes | 894 s | ~8.3 GB | NOT FIXED (JCEF's `libcef.so` only) | FIXED: 14/14 → 0/14 | PASS (before CONN ×4) |
+
+### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
+
+This replaces the out-of-sandbox stand-in (`fixes/jabref-oob-standin.nix`, above): no overlay, the after
+side is the fix branch's own derivation built by the daemon. Two runs:
+
+- `--emudhra --force-build`, 6:07 in total. The after side was built in 250 s. In the sandbox gradle
+  is much faster than out of sandbox (10:07 there). The cleaned output (`runs/emudhra-jabref.txt`) is from
+  a rerun of the same command at `f5cd6d1`, with the build already in the store ("after ok (0 built,
+  3s)"). The first run had the jar-member bug: its four after-side `-all.jar!ssl/truststore.jks` rows read
+  "n/a (pem: no certificates readable)". With the fix they read "keystore (password changeit): accepted
+  0/14". Every other line is the same.
+- The plain `ca-check ... --force-build` (synthetic test root, `runs/jabref.txt`), 5:40 in total. The matrix
+  rebuilt `jabref.override { cacert = <cacert + test root>; }` in the sandbox ("matrix build: 261s").
+  It gives the same static table and verdict as the stand-in run and the same matrix:
+
+```
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT jabref: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+eMudhra (the jar rows; `jabkit`, `jabls-cli` and `jabsrv-cli` read the same as `jabgui`, and the tokenizers
+native libraries are n/a on both sides):
+
+```
+| out:/share/java/jabref/resources/main/ssl/truststore.jks | keystore: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | keystore (password changeit): accepted 0/14 |
+| out:/lib/jabgui-6.0-alpha.6-all.jar!ssl/truststore.jks | keystore: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | keystore (password changeit): accepted 0/14 |
+VERDICT jabref emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2); after 0/14
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | CONNECTED      | REFUSED        | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT jabref live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b-aaa,dv-g3c-aaa); after REFUSED on all 4
+```
+
+- Live shim: `shims/jabref.nix` (JabRef's `TrustStoreManager` seeds and installs its store, then
+  TlsProbe in the same JVM). Refusals are `PKIX path building failed`.
+- Peak: ~12.6 GB, at the end of buildPhase and the start of installPhase. That agrees with the
+  out-of-sandbox measurement (11.9 GB build tree plus the 0.68 GB output).
+
+### jetbrains.jdk (JCEF, in the sandbox): keystore FIXED, eMudhra FIXED, live PASS; static NOT FIXED only for `libcef.so`
+
+`--after 34f61387b674b95f752688a9c49f5cc7065f3bc0` (`cacert/jetbrains-jdk`, the same commit as jdk-no-jcef).
+The after side, `jetbrains-jdk-jcef-25.0.3-b508.4`, was built in 894 s (the jcef download included), with a
+peak of ~8.3 GB. The tmpfs attempt had stopped at 7.2 GB, while writing the debug-info tarball. The run took
+17:57 in total. The build log has 118 `Certificate was added to keystore`, `--with-cacerts-file=/build/cacerts-gen/cacerts`
+in the computed configure flags, and `checking for cacerts file... /build/cacerts-gen/cacerts`, as for
+no-jcef.
+
+```
+| out:/lib/openjdk/lib/libcef.so | pem: 0 certs readable; scanner: AAA,ECC G3 | pem: 0 certs readable; scanner: AAA,ECC G3 |
+| out:/lib/openjdk/lib/security/cacerts | keystore 109 certs: 33 not in cacert, 17 in cacert but not for TLS, 59 cacert TLS roots missing [no-password]; scanner: AAA,ECC G3 | keystore 118 certs == cacert [no-password] |
+VERDICT jetbrains.jdk: NOT FIXED: an after-side store is not equivalent to cacert (see table)
+
+| out:/lib/openjdk/lib/libcef.so | n/a (pem: no certificates readable) | n/a (pem: no certificates readable) |
+| out:/lib/openjdk/lib/security/cacerts | keystore: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | keystore: accepted 0/14 |
+VERDICT jetbrains.jdk emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14; not checkable (no PEM or keystore, e.g. compiled-in roots): 1 before, 1 after store(s)
+
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | CONNECTED      | CONNECTED      | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT jetbrains.jdk live: PASS: before CONNECTED to 4/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa); after REFUSED on all 4
+```
+
+- The main verdict is NOT FIXED only because of `lib/openjdk/lib/libcef.so`: JCEF's Chromium, with a
+  compiled-in root list (the #576544 binary class, the same as `scilab-bin`). The fix does not touch it,
+  and both sides take it from the same `jcef-jetbrains-1207` input (the installed files are not byte-identical:
+  sha256 `7944d45d…` before, `859ca64d…` after, not investigated). The JDK's own keystore is FIXED (118 == cacert).
+- Live shim: `shims/jetbrains.jdk.nix`, a symlink to `jetbrains.jdk-no-jcef.nix` (TlsProbe on the JBR's
+  `java`). The live check prints the symlink target's name.

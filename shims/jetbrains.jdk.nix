@@ -1,0 +1,1 @@
+jetbrains.jdk-no-jcef.nix
