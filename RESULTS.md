@@ -2422,3 +2422,49 @@ VERDICT pgsql-tools: FIXED: before trusted CAs outside cacert; after: 1 store(s)
 | out:/lib/pgsql-tools/_internal/certifi/cacert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
 VERDICT pgsql-tools emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
 ```
+
+### python3Packages.wassima: static FIXED, eMudhra FIXED (7/14 → 0/14, installed files and wheel), behavioral PASS, live PASS
+
+wassima embeds Mozilla's CCADB list as a Python string (`wassima/_os/_embed.py`, 121 roots in 2.1.4, the
+four emSign roots included). `root_der_certificates()` uses it when the OS store (PEM files under `/etc/ssl`,
+`/etc/pki`, ...) is empty, and merges it into the OS store when that store looks stale (newest mtime more than
+3 years old). On NixOS every file there resolves into the store (mtime 1), so it is **always** merged: on this
+host, OS store 118, `stale True`, `root_der_certificates()` 121 (the 3 extra are emSign ECC Root CA - G3, ECC
+C3 and C1). niquests uses this list (`generate_ca_bundle()`).
+
+The fix is a code change, in `postPatch` because it must reach the bytecode and the `dist` wheel too (a
+`postFixup` edit of the installed `.py` would leave both `.pyc` files and the wheel with the old list): `sed`
+deletes the `CCADB_BUNDLE` string, and `substituteInPlace --replace-fail` makes `root_der_certificates()` read
+`${cacert}/etc/ssl/certs/ca-bundle.crt` at call time (`Path(...).read_text(...)`; plus `from pathlib import
+Path`). wassima's own parser reads only `BEGIN CERTIFICATE` blocks, so from the trust-rules bundle it gets
+exactly cacert's 118 TLS roots (checked: equal to the set of `ca-no-trust-rules-bundle.crt`).
+
+The static check gained one rule for this (`cacert_ref` in `lib/common.sh`): a regular file with no
+certificates of its own that names exactly one cacert bundle by store path is reported as `no certs of its
+own; names cacert:<bundle> (read at run time)` and counted as cacert; `--emudhra` checks the named bundle.
+
+```
+$ nix run github:irgolic/nix-cacert-harness -- python3Packages.wassima --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --emudhra
+| out:/lib/python3.14/site-packages/wassima/_os/_embed.py | pem 121 certs: 3 not in cacert, 0 in cacert but not for TLS, 0 cacert TLS roots missing; scanner: ECC G3 | no certs of its own; names cacert:ca-bundle.crt (read at run time) |
+(the same for __pycache__/_embed.cpython-314.pyc and .opt-1.pyc)
+  before dist:/wassima-2.1.4-py3-none-any.whl!wassima/_os/_embed.py  roots=118 trusts emSign ECC Root CA - C3,emSign ECC Root CA - G3,emSign Root CA - C1,emSign Root CA - G1
+VERDICT python3Packages.wassima: FIXED: before trusted CAs outside cacert; after: 3 store(s) == cacert, none with extra CAs
+| out:/lib/python3.14/site-packages/wassima/_os/_embed.py | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | names cacert:ca-bundle.crt pem: accepted 0/14 |
+| dist:/wassima-2.1.4-py3-none-any.whl!wassima/_os/_embed.py | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | not found |
+VERDICT python3Packages.wassima emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT python3Packages.wassima live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+
+$ nix run github:irgolic/nix-cacert-harness#behave -- python3Packages.wassima --base 8915027df75d0403ef013dd0cbf09ff3c602fd03
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+VERDICT python3Packages.wassima: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+`shims/python3Packages.wassima.nix` does one GET with `urllib` and `wassima.create_default_ssl_context()`. In
+the sandboxed cells there is no `/etc/ssl`, so the embedded list alone decides; on the host (live) it is merged
+with the host's store, as on any NixOS machine. The live run is without `--no-system-store`: the host's store
+does not hold emSign ECC Root CA - G3 as a plain certificate, so the G3 connections before the fix come from
+the embedded list.

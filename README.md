@@ -230,6 +230,11 @@ Rules for "bad":
 - A symlink into cacert, or a byte-identical copy of a cacert bundle, is good by definition.
   This holds even for `ca-bundle.crt`, which carries non-TLS roots as trust-rule blocks that
   OpenSSL honours.
+- A regular file with no certificates of its own that names exactly one cacert bundle by its store
+  path (`no certs of its own; names cacert:ca-bundle.crt (read at run time)`) is good too: code
+  patched to read cacert at run time, e.g. wassima's `_embed.py` and its `.pyc` files. `--emudhra`
+  checks the chains against the named bundle (`names cacert:ca-bundle.crt pem: accepted 0/14`). Only
+  the behavioral or live check shows that the code actually reads it.
 - JAR signature blocks (`META-INF/*.RSA`, `*.DSA`, `*.EC`, as files or inside archives) are not
   stores: they are PKCS#7 SignedData with the signer's certificate chain. The scanner flags them
   (it reads their DER as `pkcs12`, and they hold a few known roots, e.g. DigiCert's code-signing

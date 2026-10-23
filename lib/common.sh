@@ -245,6 +245,17 @@ em_summary() {
 # password first (how the JDK opens cacerts), then with changeit. Returns 1 when no certificate
 # can be read (a binary with compiled-in DER roots, a DER file, an unreadable keystore).
 EM_CA= EM_KIND=
+# cacert_ref <file>: for a regular file with no certificates of its own that names exactly one
+# cacert bundle by store path (code patched to read cacert at run time, e.g. wassima's _embed.py and
+# its .pyc files), print that path. The static and eMudhra checks then use the named bundle.
+cacert_ref() {
+  [[ -f $1 && ! -L $1 ]] || return 1
+  local r
+  r=$(grep -aoE '/nix/store/[a-z0-9]{32}-nss-cacert-[^/]+/etc/ssl/certs/[A-Za-z0-9._-]+\.crt' "$1" | sort -u)
+  [[ -n $r && $r != *$'\n'* && -f $r ]] || return 1
+  printf '%s\n' "$r"
+}
+
 em_store() {
   local f=$1 dst=$2
   EM_CA= EM_KIND=

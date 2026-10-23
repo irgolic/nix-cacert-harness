@@ -95,7 +95,11 @@ describe_store() {
   if [[ $CS_KIND == keystore && $CS_NOTE == needs-password* && ${p##*/} == cacerts ]]; then
     pwbad=1; note="$note (JVM opens cacerts without a password: 0 trust anchors at runtime!)"
   fi
-  if (( n == 0 )); then
+  local ref
+  if (( n == 0 )) && ref=$(cacert_ref "$p"); then
+    D_CACERT=1   # code that reads a cacert bundle at run time: the named bundle is the store
+    D_DESC="no certs of its own; names cacert:${ref##*/} (read at run time)"
+  elif (( n == 0 )); then
     D_DESC="${prefix}${CS_KIND}: 0 certs readable${note}"
     (( D_CACERT )) || D_BAD=1   # a keystore we cannot read is not proof of anything
   elif (( extra == 0 && other == 0 && missing == 0 )); then
@@ -149,7 +153,7 @@ scan_side() {   # <side> <outs.json> <workdir>
 # em_cell <file> <side-workdir> <accepted-file>: sets EM_DESC for one store on one side; appends the
 # names of the chains it accepts to <accepted-file>; EM_UNCHECKED=1 when it has no readable certs.
 em_cell() {
-  local f=$1 w=$2 acc=$3 tgt prefix="" list
+  local f=$1 w=$2 acc=$3 tgt prefix="" list ref
   EM_DESC= EM_UNCHECKED=0
   if [[ -L $f ]]; then
     tgt=$(readlink -f "$f")
@@ -157,7 +161,11 @@ em_cell() {
   fi
   [[ -e $f ]] || { EM_DESC="${prefix}absent"; return; }
   if [[ ! -f $f ]] || ! em_store "$f" "$w/em-store.pem"; then
-    EM_DESC="${prefix}n/a (${EM_KIND:-not a file}: no certificates readable)"; EM_UNCHECKED=1; return
+    if ref=$(cacert_ref "$f") && em_store "$ref" "$w/em-store.pem"; then
+      prefix="names cacert:${ref##*/} "
+    else
+      EM_DESC="${prefix}n/a (${EM_KIND:-not a file}: no certificates readable)"; EM_UNCHECKED=1; return
+    fi
   fi
   list=$(em_verify "$EM_CA")
   [[ -n $list ]] && printf '%s\n' "$list" >> "$acc"
