@@ -45,7 +45,7 @@ nix run github:irgolic/nix-cacert-harness -- <attr> --base <sha> --after <sha>
 Both sides are fetched as GitHub archive tarballs into the nix store (PR head commits of a
 fork are served through the base repository's archive URL). The static check always runs; the
 behavioral check runs when `shims/<attr>.nix` exists (currently: `python3Packages.httplib2`, `wordpress`,
-`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`, `eclipses.eclipse-java`, `zoneminder`, `tracecompass`, `tlaplus-toolbox`, `corretto21`, `matomo`, `monica`, `n98-magerun2`, `bazarr`, `tautulli`, `headphones`, `python3Packages.stripe`, `python3Packages.aliyun-python-sdk-core`, `rubyPackages.certified`; any JVM can reuse
+`temurin-bin`, `temurin-jre-bin`, `zulu`, `openjdk`, `jre_minimal`, `python3Packages.raven`, `graalvmPackages.graalvm-ce`, `gam`, `scilab-bin`, `julia-bin`, `julia_110-bin`, `rubyPackages.excon`, `rubyPackages.httpclient`, `rubyPackages.nap`, `rubyPackages.algoliasearch`, `invoiceplane`, `h2o`, `eclipses.eclipse-java`, `zoneminder`, `tracecompass`, `tlaplus-toolbox`, `corretto21`, `matomo`, `monica`, `n98-magerun2`, `bazarr`, `tautulli`, `headphones`, `python3Packages.stripe`, `python3Packages.aliyun-python-sdk-core`, `rubyPackages.certified`, `jabref`; any JVM can reuse
 `shims/java-runtime.nix` (a JRE bundled inside an app: `shims/bundled-jre.nix`), any Python library `shims/python-lib.nix`, any Ruby gem `shims/ruby-gem.nix`). `--shim NAME` picks another
 shim from `shims/` (and runs the behavioral check even without `shims/<attr>.nix`), e.g. `--shim python-wheel` tests the wheel in a Python package's `dist` output
 instead of the installed package (`--shim python-wheel-raven` for raven's). Results and logs land in
@@ -124,7 +124,8 @@ probes/TlsProbe.java     HTTPS probe for any JVM (compiled with --release 8)
 shims/                   per-package "make it do one HTTPS GET to $URL" snippets
 fixtures/                test root + leaf. The keys are public test material: never trust the root.
 fixes/                   overlays for --after-overlay (a NEGATIVE control; julia_*-bin without the install check;
-                         julia_*-bin with cert.pem -> ca-bundle.crt, the trust-rules variant)
+                         julia_*-bin with cert.pem -> ca-bundle.crt, the trust-rules variant; jabref-oob-standin.nix:
+                         a machine-local stand-in for builds the daemon could not do, see RESULTS.md)
 out/<attr>/{static,behave}/   working files, scanner JSON, cell results (symlinks to store paths)
 logs/                    console output of the runs in RESULTS.md
 out-negative/, out-fallback/  working files of the negative-control and no-scanner runs

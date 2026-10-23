@@ -1621,3 +1621,109 @@ VERDICT <attr>: PASS: after-fix trust follows cacert; before-fix ignores it
   into `~/.config/cudatext`, and that copy reads the hard-coded `/usr/share/cudatext/py` (seen in the
   binary and at runtime: "Cannot find data: ~/.config/cudatext/py"), so the store's
   `py/sys/certifi/cacert.pem` is never on the embedded Python's `sys.path`. Nothing to test.
+
+## The last two Java keystore fixes: jabref and jetbrains-jdk (2026-10-23)
+
+Both run from `/` with the local flake against local fix branches, base `8915027df`:
+`CAH_REPO=/home/rafael/nixpkgs nix run path:. -- <attr> --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after <sha> --force-build`.
+Cleaned outputs: `runs/<attr>.txt` in the gist.
+
+### jabref (fix branch): static FIXED, behavioral PASS, on out-of-sandbox builds (the nix daemon here cannot build it)
+
+`--after bc5739d29840b1a625dbe557acfb1a512737ebee` (`cacert/jabref`, "jabref: generate truststore.jks from
+cacert"). `postPatch` replaces `jablib/src/main/resources/ssl/truststore.jks` with the output of
+`jre-generate-cacerts ${jdk}/bin/keytool ${cacert}/etc/ssl/certs/ca-bundle.crt` (jdk25, the build JDK)
+and keeps JabRef's password `changeit`. JabRef 6.0-alpha.6 has no `jablib.jar` any more (the #576542
+entry), so the resource ends up in five places: `share/java/jabref/resources/main/ssl/truststore.jks`
+and `lib/{jabgui,jabkit,jabls-cli,jabsrv-cli}-6.0-alpha.6-all.jar!ssl/truststore.jks`.
+
+**Why the daemon cannot build it here.** Nix 2.34.9 with `build-dir` unset puts build directories in
+`/nix/var/nix/builds` (a probe derivation's `/proc/self/mountinfo`:
+`/nix/var/nix/builds/nix-2278450-2244595747/build /build ... - tmpfs rootfs`). On this machine `/`, and with
+it `/nix/var`, `/tmp` and `/var/tmp`, is one 13 GB tmpfs, with 7.7 GB free (5.3 GB of it is agent
+scratch in `/tmp`). The store's upper layer is on `/dev/vda` (ext4, 352 GB free). Client-side options:
+- `--option build-dir DIR` is refused: `warning: ignoring the client-specified setting 'build-dir',
+  because it is a restricted setting and you are not a trusted user` (`trusted-users = root`).
+- The daemon's `TMPDIR` does not matter: since `build-dir` defaults to `<state dir>/builds`, it is not
+  read, and the client cannot set it anyway (it is the systemd unit's environment).
+- A build through `nixb` with a disk watchdog (interrupt at < 600 MB free) stopped 3:22 in, still in
+  gradle's buildPhase (`:jabkit:shadowJar`), with 7.18 GB used. The earlier three attempts, when more
+  of the tmpfs was free, got through gradle and ran out in installPhase.
+
+What the daemon would need: `build-dir` on the disk, e.g. NixOS `nix.settings.build-dir =
+"/nix/.rw-store/nix-builds";` (a root-owned 0755 directory on `/dev/vda`, created with
+`systemd.tmpfiles.rules = [ "d /nix/.rw-store/nix-builds 0755 root root -" ]` if Nix does not create
+it), or a tmpfs with at least 13 GB free. `/var/tmp` is on the same tmpfs here, so it would not help.
+
+**How much it needs.** The fix's own `.drv` run outside the sandbox (`nix-shell <drv>`,
+`TMPDIR`/`HOME`/`out` redirected to `~/.cache/jabref-oob`, `shopt -s nullglob; set -e -o pipefail;
+genericBuild`) with `du` every 3 s over the build tree and `TMPDIR`: **peak 11.9 GB**, at the start of
+installPhase. At the end of buildPhase the gradle user home (in `TMPDIR`, i.e. `/build` in the sandbox)
+is 4.1 GB and the source tree 6.2 GB: each of the four apps' `build/` is 1.5 GB, 1.2 GB of it
+`distributions/` (plain and shadow, tar and zip of each). installPhase then unpacks the four shadow
+tars next to them. `$out` (680 MB) is in the store, not in the build dir.
+
+**Out-of-sandbox builds** (not sandboxed, so evidence, not a substitute for a Hydra/ofborg build):
+
+| build | time | peak build dir |
+|---|---|---|
+| fix branch `.drv` (`983j1rhh…`) | 10:07 (gradle "BUILD SUCCESSFUL in 8m 42s"; slower than the sandbox's 3m 21s: virtiofs, `nice`) | 11.9 GB |
+| after-test `.drv` (`aqq3a6a6…`, `jabref.override { cacert = <cacert + test root>; }`, as `lib/behave.nix` builds it) | 12:44 | 11.8 GB |
+
+- The first run without `nullglob` stopped in installPhase at the package's
+  `jar=$(ls $out/lib/embedded-postgres-binaries-linux-$ARCH1-*.jar)`. No such jar exists (not in
+  Hydra's output of the base either); under stdenv's `shopt -s nullglob` the glob vanishes and `ls`
+  lists the current directory, while `nix-shell --run` turns `nullglob` off. The line is dead code that
+  only passes by accident. It is not touched by the fix; worth a separate cleanup.
+- Both outputs reference exactly the 20 store paths in the `References` of Hydra's base output
+  (`bz0jhdad…`, cached on cache.nixos.org), and cacert is in neither runtime closure.
+- They were imported with `nix store add` and given GC roots in
+  `~/.cache/nix-cacert-harness/jabref/oob-{after,testroot}`. `fixes/jabref-oob-standin.nix` makes the
+  after side's `jabref` a copy of the first (out-of-sandbox paths rewritten, the 20 references
+  restored) and its `.override { cacert }` with the harness's test-root cacert a copy of the second.
+  The harness then runs unchanged with `--after-overlay fixes/jabref-oob-standin.nix` (1:36 in total;
+  the base output was fetched from the cache).
+
+```
+| out:/share/java/jabref/resources/main/ssl/truststore.jks | keystore 89 certs: 35 not in cacert, 15 in cacert but not for TLS, 79 cacert TLS roots missing [no-password]; scanner: AAA | keystore 118 certs == cacert [needs-password(changeit)] |
+
+inside archives (scanner only; a symlink in the installed output cannot reach them, issue #576542 class):
+  before out:/lib/jabgui-6.0-alpha.6-all.jar!ssl/truststore.jks  roots=81 trusts AAA Certificate Services
+  (same for jabkit, jabls-cli, jabsrv-cli)
+  after  out:/lib/jabgui-6.0-alpha.6-all.jar!ssl/truststore.jks  roots=115 trusts emSign Root CA - G1
+  (same for jabkit, jabls-cli, jabsrv-cli)
+  before and after: lib/*-all.jar!native/lib/{osx-aarch64/cpu/libtokenizers.dylib,win-x86_64/cpu/tokenizers.dll}  roots=137 trusts emSign ECC Root CA - G3, ...
+VERDICT jabref: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs (+ bundles inside archives remain, see above)
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT jabref: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- The jar copies, which the harness only scans: I extracted `ssl/truststore.jks` from all four
+  `-all` jars of the fix build. Each is byte-identical to the `share/java` copy: PKCS12, `keytool -list
+  -storepass changeit`: "Your keystore contains 118 entries", and its SHA-256 set equals cacert's
+  `ca-no-trust-rules-bundle.crt` (118). The scanner's "roots=115 ... emSign Root CA - G1" is its own
+  known-root list; emSign Root CA - G1 is in cacert. Before: JKS, 89 entries, including AAA Certificate
+  Services. The test-root build's store has 119 entries: the same 118 plus the test root
+  (`06EFEEC3...0135`).
+- "(+ bundles inside archives remain)" is the jar copies (checked above) plus DJL tokenizers native
+  libraries for macOS and Windows (`native/lib/*/cpu/*tokenizers*`) with a compiled-in root list that
+  includes emSign ECC Root CA - G3. They are identical before and after, cannot load on Linux, and
+  belong to the binary class (#576544), not to this fix.
+- Shim (`shims/jabref.nix`, 29 lines plus an 8-line comment): it calls
+  `org.jabref.logic.net.ssl.TrustStoreManager.createTruststoreFileIfNotExist(<TMPDIR>/jabref/ssl/truststore.jks)`
+  reflectively, which is what the jabgui and jabkit launchers do at startup. That call seeds the file from
+  the jar's `/ssl/truststore.jks` and installs JabRef's merged X509TrustManager (its store, then the
+  JRE's) as the default `SSLContext`. The shim then runs `TlsProbe` in the same JVM. It uses the
+  package's own JRE (the `java` in `bin/jabkit`) and `lib/jabkit-*-all.jar`. That JRE
+  (`openjdk-minimal-jre-25.0.4.1+1`, jlinked from jdk25) is built with the stock cacert in all four cells,
+  so only JabRef's own store can make a cell connect. Injection is the default (`jabref` declares
+  `cacert` after the fix).
+- Shim logs: the seeded file is 102206 bytes before (the vendored JKS), 157184 after, 158480 after-test.
+  The refusing cells end in `PKIX path building failed`; after-test prints `OK status=200
+  cipher=TLS_AES_256_GCM_SHA384`.
+- Existing users keep their already-seeded `~/.local/share/jabref/ssl/truststore.jks`. JabRef only
+  copies the resource when the file is missing.
