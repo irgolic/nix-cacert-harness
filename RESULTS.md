@@ -1784,6 +1784,20 @@ VERDICT jetbrains.jdk-no-jcef: PASS: after-fix trust follows cacert; before-fix 
 - "cacert in runtime closure: no" on both sides is expected: the keystore is generated at build time.
 - Space: the build-dir tmpfs (see jabref above) was enough for one JBR build at a time, not two.
 
+### jetbrains.jdk (with JCEF, fix branch): not built here, the build dir is too small
+
+Dry-run: one derivation to build (`jetbrains-jdk-jcef-25.0.3-b508.4.drv`), with `jcef-jetbrains-1207`
+(290 MiB download, 640 MiB unpacked) and thrift fetched; the base output is on cache.nixos.org. Since
+the no-jcef build took 14:24, I tried it, alone, through `nixb` with the disk watchdog. The watchdog
+stopped it 15:28 in, with 7.2 GB of the build-dir tmpfs used and 0.52 GB left. At that point JetBrains'
+`mkimages_x64.sh` had built both images and was writing the debug-info tarball
+`jbrsdk_jcef-25.0.3-linux-x64-b508.4_diz.tar.gz`; installPhase had not started. The JCEF variant
+copies jcef into the build tree and into both images, so it needs more than the ~7.7 GB this machine
+has free there. Its log shows the same wiring as no-jcef: 118 `Certificate was added to keystore`,
+`--with-cacerts-file=/build/cacerts-gen/cacerts` in the computed configure flags, and
+`checking for cacerts file... /build/cacerts-gen/cacerts`. The fix is the same `common.nix` code path
+for both attributes; the built-store evidence is from `jdk-no-jcef` only.
+
 ## eMudhra chains: offline (`--emudhra`) and live hosts (`ca-live-check`) (2026-10-23)
 
 Twelve fix branches checked against the certificates of the incident itself
@@ -2044,18 +2058,3 @@ before   | REFUSED        | REFUSED        | REFUSED        | REFUSED
 after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
 VERDICT frostwire-bin live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
 ```
-
-
-### jetbrains.jdk (with JCEF, fix branch): not built here, the build dir is too small
-
-Dry-run: one derivation to build (`jetbrains-jdk-jcef-25.0.3-b508.4.drv`), with `jcef-jetbrains-1207`
-(290 MiB download, 640 MiB unpacked) and thrift fetched; the base output is on cache.nixos.org. Since
-the no-jcef build took 14:24, I tried it, alone, through `nixb` with the disk watchdog. The watchdog
-stopped it 15:28 in, with 7.2 GB of the build-dir tmpfs used and 0.52 GB left. At that point JetBrains'
-`mkimages_x64.sh` had built both images and was writing the debug-info tarball
-`jbrsdk_jcef-25.0.3-linux-x64-b508.4_diz.tar.gz`; installPhase had not started. The JCEF variant
-copies jcef into the build tree and into both images, so it needs more than the ~7.7 GB this machine
-has free there. Its log shows the same wiring as no-jcef: 118 `Certificate was added to keystore`,
-`--with-cacerts-file=/build/cacerts-gen/cacerts` in the computed configure flags, and
-`checking for cacerts file... /build/cacerts-gen/cacerts`. The fix is the same `common.nix` code path
-for both attributes; the built-store evidence is from `jdk-no-jcef` only.
