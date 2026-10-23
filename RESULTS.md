@@ -2091,6 +2091,7 @@ Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
 | jetbrains.jdk (JCEF) | `34f61387b` | yes | 894 s | ~8.3 GB | NOT FIXED (JCEF's `libcef.so` only) | FIXED: 14/14 → 0/14 | PASS (before CONN ×4) |
 | eddie | `1ed46a6c3` | **no**: both sides fail in a dependency (PowerShell 7.0.0 nupkg, patchelf abort) | - | ~6.0 GB (fetches, failed builds) | INCOMPLETE | INCOMPLETE | skipped (GUI, no shim) |
 | gpac | `13307d886` | yes | 130 s | ~0.6 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (the default build has no TLS; see below) |
+| linphonePackages.liblinphone | `874cd910f` | yes | 285 s (and a python3 env) | ~0.35 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (no usable CLI; see below) |
 
 ### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
 
@@ -2211,3 +2212,40 @@ Why there is no live shim:
     OpenSSL's default cert file (`$SSL_CERT_FILE`, else the compiled-in path) or libcurl's CA bundle does not exist.
   - The OpenSSL path calls `SSL_CTX_set_default_verify_paths` first in any case.
 - The full-deps variant is not a nixpkgs attribute and was not built here.
+
+### linphonePackages.liblinphone: static FIXED, eMudhra FIXED (14/14 → 0/14); no live shim
+
+`--after 874cd910fc35cceb9038dcbbb704befdb0b0393f` (`cacert/liblinphone`; `postInstall` replaces
+`share/linphone/rootca.pem` with a symlink to cacert's `ca-bundle.crt`). The after side was built in 285 s
+(`liblinphone` and its nativeBuildInputs' python3 env), with a peak of ~0.35 GB; the run took 5:11.
+
+```
+| out:/share/linphone/rootca.pem | pem 146 certs: 27 not in cacert, 18 in cacert but not for TLS, 17 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT linphonePackages.liblinphone: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+| out:/share/linphone/rootca.pem | pem: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT linphonePackages.liblinphone emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+```
+
+- **Who reads the file.** `linphone_core_new` takes `rootca.pem` from its data resources
+  (`coreapi/linphonecore.c`) unless `[sip] root_ca` is set. belle-sip loads it with mbedTLS (bctoolbox)
+  for SIP over TLS and for HTTPS (provisioning, file transfer).
+  - The offline check uses OpenSSL, which honours the trust rules of cacert's `ca-bundle.crt`.
+  - cacert 3.131.1's `ca-bundle.crt` holds 169 `TRUSTED CERTIFICATE` blocks and 118 plain
+    `CERTIFICATE` blocks. The plain blocks, taken in order, are byte-identical to the certificates of
+    `ca-no-trust-rules-bundle.crt` (same sha256 over the extracted blocks).
+  - mbedTLS's PEM reader only takes `-----BEGIN CERTIFICATE-----` blocks, so liblinphone after the fix
+    should load exactly the 118 TLS roots. The source of linphone's bc-mbedtls (`library/x509_crt.c` and
+    `library/pem.c`) searches for that plain header with `strstr`. This was not run here.
+- **No live shim.** liblinphone has no `linphonec` (`ENABLE_CONSOLE_UI` is OFF upstream). Its `bin/` has
+  `liblinphone-sendmsg`, `linphone-daemon` and test tools. I tried `liblinphone-sendmsg` with a TLS route
+  to the test host (two control handshakes plus two requests, against `dv-g3b` and `dv-g3b-aaa`).
+  - Out of the box it aborts: `belr-error- Could not load grammar sip_grammar.belr` / `belle-sip-fatal-
+    Unable to load SIP grammar`. belle-sip's grammar is neither in liblinphone's `share/belr/grammars`
+    (only belcard's are linked there) nor in belr's own prefix. linphone-desktop works around this with
+    a `grammars` symlinkJoin. This is a packaging problem of the nixpkgs CLI tools, not related to the fix.
+  - With the grammars in place, the tool starts but opens no SIP transport without a config file:
+    `No listening point matching for [udp://dv-g3b-emudhra.we-have-a-problem.com:5060]`. The route
+    is not used either.
+  - A working shim would need a config file with TLS transports, or a scripted `linphone-daemon` session.
+    That was not done. The attempt is not in the repository.
