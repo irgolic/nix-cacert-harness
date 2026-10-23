@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ca-static-check: before/after static comparison of the CA trust stores shipped by a package.
 #
-#   ca-static-check [--base REV] [--after REV] [--after-overlay FILE] [--dry-run-only] [--force-build] ATTR...
+#   ca-static-check [--base REV] [--after REV] [--after-overlay FILE] [--dry-run-only] [--force-build] [--emudhra] ATTR...
 #
 # before = ATTR evaluated at the base commit (default: merge-base HEAD upstream/master),
 #          exported read-only with builtins.fetchGit (no checkout).
@@ -11,10 +11,13 @@
 # when the dry-run shows a heavy or long build. Every trust store found by nix-cacert-scan
 # (plus every symlink into cacert, plus every Java keystore) is turned into a set of SHA-256
 # fingerprints and compared with the set in cacert's ca-no-trust-rules-bundle.crt.
+# --emudhra (opt-in; the output without it is unchanged) also verifies the 14 chains served by the
+# eMudhra test hosts (fixtures/emudhra) against every store, offline, and prints its own table and
+# its own "VERDICT ATTR emudhra:" line after the usual ones.
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
-pr= base= after= overlay= dry_only=0 force=0 attrs=()
+pr= base= after= overlay= dry_only=0 force=0 emudhra=0 attrs=()
 while (( $# )); do
   case $1 in
     --base) base=$2; shift 2 ;;
@@ -23,11 +26,12 @@ while (( $# )); do
     --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
     --dry-run-only) dry_only=1; shift ;;
     --force-build) force=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --emudhra) emudhra=1; shift ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) attrs+=("$1"); shift ;;
   esac
 done
-(( ${#attrs[@]} )) || die "usage: ca-static-check [--base REV] [--after REV] [--after-overlay FILE] ATTR..."
+(( ${#attrs[@]} )) || die "usage: ca-static-check [--base REV] [--after REV] [--after-overlay FILE] [--emudhra] ATTR..."
 
 mkdir -p "$CAH_OUT"
 if [[ -n $pr ]]; then pr_out=$(cah_pr "$pr") || exit 2; read -r base after <<<"$pr_out"; fi
@@ -139,6 +143,102 @@ scan_side() {   # <side> <outs.json> <workdir>
       [[ $t == *-nss-cacert-* ]] && printf '%s\t%s\t%s\n' "$o" "${l#"$path"}" "$t" >> "$w/links.tsv"
     done
   done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$outs")
+}
+
+# --- --emudhra: the eMudhra test chains against every store (offline) ---------------------------
+# em_cell <file> <side-workdir> <accepted-file>: sets EM_DESC for one store on one side; appends the
+# names of the chains it accepts to <accepted-file>; EM_UNCHECKED=1 when it has no readable certs.
+em_cell() {
+  local f=$1 w=$2 acc=$3 tgt prefix="" list
+  EM_DESC= EM_UNCHECKED=0
+  if [[ -L $f ]]; then
+    tgt=$(readlink -f "$f")
+    if [[ $tgt == *-nss-cacert-* ]]; then prefix="symlink->cacert:${tgt##*/} "; else prefix="symlink "; fi
+  fi
+  [[ -e $f ]] || { EM_DESC="${prefix}absent"; return; }
+  if [[ ! -f $f ]] || ! em_store "$f" "$w/em-store.pem"; then
+    EM_DESC="${prefix}n/a (${EM_KIND:-not a file}: no certificates readable)"; EM_UNCHECKED=1; return
+  fi
+  list=$(em_verify "$EM_CA")
+  [[ -n $list ]] && printf '%s\n' "$list" >> "$acc"
+  EM_DESC="${prefix}${EM_KIND}: accepted $(em_summary <(printf '%s\n' $list))"
+}
+
+# em_member <archive> <member> <dst>: extract one member of a zip archive (jar, wheel).
+em_member() {
+  python3 -I -c 'import shutil, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z, z.open(sys.argv[2]) as s, open(sys.argv[3], "wb") as d:
+    shutil.copyfileobj(s, d)' "$@" 2>/dev/null
+}
+
+# Uses the loop variables of the main check: attr, W, STATUS, cands.
+emudhra_report() {
+  local o rel side p cells rows=() arows=() total ev sb sa nb na nab rest unchk_b=0 unchk_a=0 a m
+  total=$(em_names | grep -c .)
+  for side in before after; do : > "$W/$side/emudhra-accepted"; : > "$W/$side/emudhra-accepted-archives"; done
+  while IFS=$'\t' read -r o rel; do
+    [[ -n $o ]] || continue
+    cells=()
+    for side in before after; do
+      if [[ ${STATUS[$side]} != ok* ]]; then cells+=("n/a"); continue; fi
+      p=$(jq -r --arg o "$o" '.[$o] // empty' "$W/$side/outs.json" 2>/dev/null)
+      [[ -n $p ]] || { cells+=("no such output"); continue; }
+      em_cell "$(readlink -f "$p")$rel" "$W/$side" "$W/$side/emudhra-accepted"
+      cells+=("$EM_DESC")
+      if (( EM_UNCHECKED )); then if [[ $side == before ]]; then unchk_b=$((unchk_b + 1)); else unchk_a=$((unchk_a + 1)); fi; fi
+    done
+    rows+=("| $o:$rel | ${cells[0]} | ${cells[1]} |")
+  done <<<"$cands"
+  # Members of zip archives (wheels, jars), known from the scanner: extracted and checked the same way.
+  while IFS=$'\t' read -r o rel; do
+    [[ -n $o ]] || continue
+    cells=()
+    for side in before after; do
+      if [[ ${STATUS[$side]} != ok* ]]; then cells+=("n/a"); continue; fi
+      if ! awk -F'\t' -v o="$o" -v r="$rel" '$1 == o && $2 == r {f = 1} END {exit !f}' "$W/$side/findings.tsv" 2>/dev/null; then
+        cells+=("not found"); continue
+      fi
+      p=$(jq -r --arg o "$o" '.[$o] // empty' "$W/$side/outs.json" 2>/dev/null)
+      a=${rel%%!*} m=${rel#*!}
+      if [[ $m == *'!'* ]]; then cells+=("n/a (nested archive)"); continue; fi
+      if ! em_member "$(readlink -f "$p")$a" "$m" "$W/$side/em-member"; then cells+=("n/a (not a zip member)"); continue; fi
+      em_cell "$W/$side/em-member" "$W/$side" "$W/$side/emudhra-accepted-archives"
+      cells+=("$EM_DESC")
+      rm -f "$W/$side/em-member"
+    done
+    arows+=("| $o:$rel | ${cells[0]} | ${cells[1]} |")
+  done < <(cut -f1,2 "$W"/before/findings.tsv "$W"/after/findings.tsv 2>/dev/null | grep '!' | sort -u)
+  rm -f "$W"/{before,after}/em-store.pem
+
+  echo
+  echo "eMudhra chains (--emudhra; offline and reproducible): the 14 chains in fixtures/emudhra,"
+  echo "each leaf verified against each store (openssl verify -purpose sslserver, at 2026-10-23):"
+  printf '%s\n' "| output:path | before | after |" "|---|---|---|"
+  (( ${#rows[@]} )) && printf '%s\n' "${rows[@]}"
+  (( ${#rows[@]} )) || echo "| (no trust stores or cacert links found) | | |"
+  if (( ${#arows[@]} )); then
+    echo "inside archives (zip members, extracted):"
+    printf '%s\n' "${arows[@]}"
+  fi
+  # "7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2)"
+  em_phrase() { local x; x=$(em_summary "$1"); if [[ $x == *' '* ]]; then echo "${x%% *} compromised eMudhra chains ${x#* }"; else echo "$x compromised eMudhra chains"; fi; }
+  sb=$(em_phrase "$W/before/emudhra-accepted"); nb=$(sort -u "$W/before/emudhra-accepted" | grep -c .)
+  sa=$(em_phrase "$W/after/emudhra-accepted"); na=$(sort -u "$W/after/emudhra-accepted" | grep -c .)
+  nab=$(sort -u "$W/after/emudhra-accepted-archives" | grep -c .)
+  if [[ ${STATUS[before]} != ok* || ${STATUS[after]} != ok* ]]; then
+    ev="INCOMPLETE (a side was not built)"
+    [[ ${STATUS[before]} == ok* ]] && ev="$ev; before accepted $sb"
+    [[ ${STATUS[after]} == ok* ]] && ev="$ev; after accepts $sa"
+  elif (( na > 0 )); then ev="NOT FIXED: after accepts $sa (see table); before accepted ${sb%% *}"
+  elif (( nb > 0 )); then ev="FIXED: before accepted $sb; after 0/$total"
+  else ev="NOT AFFECTED: no store on either side accepts any of the $total chains (before 0/$total, after 0/$total)"
+  fi
+  if (( nab > 0 )); then ev="$ev (+ after-side archive members accept $(em_summary "$W/after/emudhra-accepted-archives"), see table)"; fi
+  rest=()
+  (( unchk_b )) && rest+=("$unchk_b before")
+  (( unchk_a )) && rest+=("$unchk_a after")
+  if (( ${#rest[@]} )); then ev="$ev; not checkable (no PEM or keystore, e.g. compiled-in roots): $(IFS=,; echo "${rest[*]}" | sed 's/,/, /g') store(s)"; fi
+  echo "VERDICT $attr emudhra: $ev"
 }
 
 for attr in "${attrs[@]}"; do
@@ -270,5 +370,6 @@ for attr in "${attrs[@]}"; do
   if (( arch_bad_after )); then verdict="$verdict (+ bundles inside archives remain, see above)"
   elif (( arch_after )); then verdict="$verdict (+ after-side archive copies are byte-identical to cacert)"; fi
   echo "VERDICT $attr: $verdict"
+  (( emudhra )) && emudhra_report
   unset DRV STATUS OUTS
 done

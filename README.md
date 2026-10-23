@@ -56,6 +56,10 @@ unless `--force-build` is given. `nix` and `git` are taken from your PATH.
 Inside a nixpkgs checkout the arguments are optional: "before" is the merge-base of HEAD with
 `upstream/master`, `origin/master` or `master`, and "after" is the working tree.
 
+Opt-in, and documented separately below: `--emudhra` checks the package against the certificate chains
+of the eMudhra incident, offline and against the live test hosts, instead of the synthetic test root
+(see "Opt-in: the eMudhra incident's own certificates"). Without the flag the output is as above.
+
 ### Example: the merged wordpress fix, NixOS/nixpkgs#576572
 
 ```console
@@ -113,6 +117,7 @@ VERDICT wordpress: PASS: after-fix trust follows cacert; before-fix ignores it
 bin/ca-check             one command per package: static, then behavioral if a shim exists (--pr/--after/--base)
 bin/ca-static-check      approach 1 (before/after table of trust stores vs cacert)
 bin/ca-behave-check      approach 2 (2x2 behavioral matrix in the nix sandbox)
+bin/ca-live-check        opt-in: the package's shim against the live eMudhra test hosts, outside the sandbox (needs network)
 bin/gen-test-ca          one-time generation of the throwaway test root + localhost leaf
 lib/common.sh            base resolution, fetchGit export, dry-run policy, cert-set helpers
 lib/certset.py           fast PEM -> SHA-256 fingerprint + subject (stdlib only, one process)
@@ -120,13 +125,18 @@ lib/tools.nix            openssl, jq, curl, gawk, python3, keytool (jre_minimal)
 lib/nixpkgs.nix          nixpkgs + optional overlay (to try a fix before editing the tree)
 lib/behave.nix           one behavioral cell (side x cacert variant)
 lib/matrix.nix           the four cells as one attrset (one nixb queue slot)
+lib/live.nix             the runnable wrapper of ca-live-check (shim script + its inputs, stock package of one side)
+lib/probes.nix           the Java probe, shared by behave.nix and live.nix
 probes/TlsProbe.java     HTTPS probe for any JVM (compiled with --release 8)
 shims/                   per-package "make it do one HTTPS GET to $URL" snippets
+shims/live/              shims used only by ca-live-check (olvid, frostwire-bin), not by the behavioral matrix
 fixtures/                test root + leaf. The keys are public test material: never trust the root.
+fixtures/emudhra/        the 14 chains served by the eMudhra test hosts (public certificates; SOURCE.txt);
+                         left out of the behavioral cells' fixture path
 fixes/                   overlays for --after-overlay (a NEGATIVE control; julia_*-bin without the install check;
                          julia_*-bin with cert.pem -> ca-bundle.crt, the trust-rules variant; jabref-oob-standin.nix:
                          a machine-local stand-in for builds the daemon could not do, see RESULTS.md)
-out/<attr>/{static,behave}/   working files, scanner JSON, cell results (symlinks to store paths)
+out/<attr>/{static,behave,live}/   working files, scanner JSON, cell results (symlinks to store paths), live logs
 logs/                    console output of the runs in RESULTS.md
 out-negative/, out-fallback/  working files of the negative-control and no-scanner runs
 ```
@@ -340,6 +350,130 @@ Sketched, untested shim ideas for other families:
 GUI apps, servers and archive-embedded bundles are not practical to drive this way. Use
 approach 1 for those.
 
+## Opt-in: the eMudhra incident's own certificates (`--emudhra`, `ca-live-check`)
+
+**Without `--emudhra` nothing changes.** `ca-check` and `ca-static-check` print the same tables and
+VERDICT lines as before, so the `nix run … -- <attr> --pr <N>` commands quoted in PR descriptions
+keep their meaning. The flag is documented here only.
+
+```sh
+nix run github:irgolic/nix-cacert-harness -- <attr> --pr <N> --emudhra
+```
+
+`ca-check --emudhra` runs two parts and **skips the synthetic-root matrix** (no test-root rebuilds):
+
+1. **`[1/2]` offline, reproducible**: `ca-static-check --emudhra`, i.e. the usual static check, then
+   its own table and its own VERDICT line for the 14 certificate chains published at
+   <https://emudhra.we-have-a-problem.com/> (`fixtures/emudhra/`, public certificates only, leaf
+   first; provenance and hashes in `fixtures/emudhra/SOURCE.txt`).
+2. **`[2/2]` live, needs network, NOT reproducible offline**: `ca-live-check`, the package's shim
+   run outside any sandbox against the live test hosts. Everything else in this repository works
+   offline from the nix store; this part depends on those hosts being up and serving the same chains.
+
+### Offline: `ca-static-check --emudhra`
+
+Every store that the static check finds on each side (PEM bundles, symlinks into cacert, Java
+keystores, plus the zip members of wheels and jars that the scanner reports) is checked against
+each chain, as `fixtures/emudhra/README.txt` describes:
+
+```
+openssl verify -attime 1792713600 -purpose sslserver -no-CApath -no-CAstore -CAfile <store> -untrusted <chain> <chain>
+```
+
+- Keystores are exported to PEM first (`keytool -list -rfc`, without a password, then with `changeit`).
+  A store with no readable certificate (compiled-in DER roots in a binary) is "n/a" and counted as
+  not checkable.
+- `-purpose sslserver`: what libssl checks in a TLS client. It makes OpenSSL honour the trust rules of
+  a trust-rules bundle: cacert's `ca-bundle.crt` carries AAA Certificate Services as e-mail only, so it
+  rejects the AAA chains. `-no-CApath -no-CAstore` keep the host's `/etc/ssl` out of it.
+- `-attime` is fixed at 2026-10-23 00:00 UTC, the download date, so the result does not change when
+  the leaves expire (May 2027). Revocation is not checked.
+- Per store: `accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2)` or `accepted 0/14`. `g3` is the 7
+  chains via emSign Root TLS CA - G3 and emSign ECC Root CA - G3, `aaa` the 7 via the AAA Certificate
+  Services cross-sign, `noct` the 2 leaves without SCTs (one of each).
+
+```
+VERDICT python3Packages.httplib2 emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2); after 0/14
+```
+
+- `NOT FIXED`: an after-side store accepts any chain, whatever its fingerprint set or its link
+  target.
+- `FIXED`: before accepted some chain, after accepts none. A before-side store that accepts chains is
+  the most direct evidence that the package was exposed.
+- `NOT AFFECTED`: no store on either side accepts any chain.
+- `INCOMPLETE`: a side was not built.
+- After-side archive members that still accept chains are added as `(+ after-side archive members
+  accept …)`, as the main verdict does for archives. Stores that could not be checked are counted at
+  the end.
+
+The main `VERDICT <attr>:` line is not affected by any of this.
+
+### Live: `ca-live-check`
+
+```
+bin/ca-live-check [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--shim NAME|FILE]
+                  [--hosts dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa] [--sides "before after"] [--timeout SEC]
+                  [--no-system-store] [--force-build] [--dry-run-only] ATTR
+```
+
+- For each side it builds a small wrapper (`lib/live.nix`): the shim's script for the *stock* package
+  (no injection), with the shim's inputs on PATH and `PKG`/`CACERT` set as in a cell. The build is
+  cached and goes through nixb, with the usual dry-run policy.
+- It runs that wrapper **on the host, outside any sandbox**, once per host against
+  `https://<host>-emudhra.we-have-a-problem.com/`, under `env -i`: no `SSL_CERT_FILE`,
+  `NIX_SSL_CERT_FILE` or `SSL_CERT_DIR`, and `HOME` and `TMPDIR` in a fresh directory. The package's own
+  store decides.
+- Results: `CONNECTED` (the shim exited 0), `REFUSED` (a certificate-verification error, with the same
+  regex as `lib/behave.nix`), or `ERROR` (anything else, including the timeout).
+- **Hosts.** The default is `dv-g3b`, `dv-g3b-aaa` (via the AAA cross-sign), `dv-g3c` and `dv-g3c-aaa`.
+  The `-noct-` hosts are skipped by default: their leaves carry no SCTs, so CT-enforcing clients (the
+  browsers) reject them whatever their trust store says. None of the clients tested here enforce CT,
+  so the `-noct-` hosts would only add requests; `--hosts` can still name them, or the `ov-`/`ev-`
+  variants (any name with a file in `fixtures/emudhra/`).
+- **Politeness.** Each run makes one control handshake per host (`openssl s_client`, with one GET),
+  then one request per host per side. Every request has a 10 s timeout (`--timeout`).
+- **Controls**, per host, from that handshake:
+  - the host is reachable and answers HTTP 200;
+  - the served chain equals the fixture file (same SHA-256 fingerprints, in order);
+  - it is a valid TLS chain for that host name up to its top certificate (`-partial_chain`), whose
+    issuer is printed (emSign ECC Root CA - G3 or AAA Certificate Services);
+  - the after side's cacert (both bundles) rejects it.
+
+  A host that fails its control is left out of the verdict.
+- **The host's system store.** On NixOS, `/etc/ssl/certs/ca-certificates.crt` and
+  `/etc/pki/tls/certs/ca-bundle.crt` are visible outside the sandbox. A program that adds OpenSSL's
+  default paths to its own store (excon) reads them too.
+  - The control checks each served chain against these stores and prints whether they accept it. If
+    one does, a `CONNECTED` there may come from it, not from the package.
+  - `--no-system-store` puts an empty tmpfs over `/etc/ssl` and `/etc/pki`, using `bwrap` from the
+    base nixpkgs; the network is unchanged. This is for programs that read the system store
+    *instead of* their own when it exists. Julia's `NetworkOptions.ca_roots_path()` does: it prefers
+    `/etc/ssl/certs/ca-certificates.crt` to its bundled `cert.pem`.
+  - `--no-system-store` needs unprivileged user namespaces.
+- **Shims.** These are the behavioral check's shims (`shims/<attr>.{nix,sh}`). Shims meant only for this
+  check live in `shims/live/`, where `ca-check`'s behavioral matrix does not look. There are two so far:
+  `olvid` and `frostwire-bin`, which run the probe on the JVM their launchers actually exec.
+- `--after-overlay` works as elsewhere (the wrapper imports the side's nixpkgs with the overlay).
+
+```
+python3Packages.httplib2  (live; before 8915027df75d0403ef013dd0cbf09ff3c602fd03, after 8e60aed8faacaa025a574bfa8df22c25340a502f)
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | CONNECTED      | REFUSED        | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT python3Packages.httplib2 live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b-aaa,dv-g3c-aaa); after REFUSED on all 4
+```
+
+Verdicts:
+
+| verdict | meaning |
+|---|---|
+| `PASS` | before CONNECTED on at least one host, after REFUSED on every host |
+| `FAIL` | after CONNECTED on some host: the fixed package still accepts a compromised chain (a red flag) |
+| `INCONCLUSIVE-BEFORE` | after REFUSED everywhere, but before never connected either: the program's runtime store never trusted these chains (e.g. it runs on the already-fixed openjdk, and the static check flagged a store it does not read). Not a PASS. |
+| `ERROR` | an after cell gave no certificate verdict (shim or package broken, timeout) |
+| `INVALID` | no host passed its control |
+| `INCOMPLETE` | a side was not built (heavy rebuild skipped, build failure) |
+
 ## How to run (per package)
 
 ```sh
@@ -347,6 +481,9 @@ H=/path/to/cacert-harness
 $H/bin/ca-check <attr>          # both: static always, behavioral if shims/<attr>.{nix,sh} exists
 $H/bin/ca-static-check <attr>   # approach 1 only (any package, several attrs allowed)
 $H/bin/ca-behave-check <attr>   # approach 2 only
+$H/bin/ca-check <attr> --emudhra          # opt-in: static + offline eMudhra chains + live hosts (no test-root matrix)
+$H/bin/ca-static-check --emudhra <attr>   # opt-in: static + offline eMudhra chains (reproducible)
+$H/bin/ca-live-check <attr>               # opt-in: live eMudhra hosts only (needs network; --hosts, --timeout, --no-system-store)
 # options: --base REV  --after-overlay fix.nix  --force-build
 #          behavioral only: --shim NAME|FILE (NAME = shims/NAME.nix or .sh)  --sides after  --rerun
 # env: CAH_REPO, CAH_OUT (default $H/out), CAH_NIXB, CAH_MAX_BUILDS, CAH_HEAVY_RE, CAH_SCANNER_REF
@@ -408,6 +545,13 @@ For about 60 packages, expect the cost of rebuilding each package once more, wit
 test-root cacert, plus about 1 min each. Heavy packages are skipped automatically.
 
 ## Limitations
+
+- `ca-live-check` (and so `ca-check --emudhra`) needs network access to the eMudhra test hosts and is
+  not reproducible offline: its result depends on those hosts being up and serving the chains in
+  `fixtures/emudhra`, which the controls check on every run. The offline half of `--emudhra` and
+  everything else in this repository only need the nix store. Outside the sandbox the host's own
+  system store is visible; the run prints whether it accepts the served chains (`--no-system-store`
+  hides it).
 
 - Approach 1 only sees what the scanner (or the fallback) flags. Roots compiled into
   binaries as DER (webpki and friends, the #576544 class) show up as findings but cannot be

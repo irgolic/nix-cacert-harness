@@ -200,3 +200,68 @@ cah_pr() {
   log "PR #$n: $(jq -r .title <<<"$j")  base=${b:0:12} head=${h:0:12}"
   echo "github:$repo/$b github:$repo/$h"
 }
+
+# --- eMudhra chains (ca-static-check --emudhra, ca-live-check) -------------------------------
+# fixtures/emudhra holds the 14 chains served by the eMudhra test hosts (leaf first, public
+# certificates only; provenance in fixtures/emudhra/SOURCE.txt). They are verified at a fixed time,
+# the day they were downloaded, so the result does not change when the leaves expire (May 2027).
+CAH_EMUDHRA_DIR=${CAH_EMUDHRA_DIR:-$CAH_HOME/fixtures/emudhra}
+CAH_EMUDHRA_ATTIME=${CAH_EMUDHRA_ATTIME:-1792713600}   # 2026-10-23T00:00:00Z
+EM_SUFFIX=-emudhra.we-have-a-problem.com
+
+# Chain names (dv-g3b, dv-g3b-aaa, ..., dv-g3b-aaa-noct), one per line.
+em_names() { local f; for f in "$CAH_EMUDHRA_DIR"/*"$EM_SUFFIX".pem; do f=${f##*/}; echo "${f%"$EM_SUFFIX".pem}"; done; }
+
+# em_verify <cafile> [name...]: prints the names of the chains (default: all) whose leaf verifies
+# against <cafile> as the only trust anchors, with the rest of the chain file as untrusted
+# intermediates (fixtures/emudhra/README.txt), for TLS server use, as a TLS client checks it.
+# -purpose sslserver makes OpenSSL honour the trust rules of a trust-rules bundle (cacert's
+# ca-bundle.crt: AAA Certificate Services is e-mail only), as libssl does in a TLS client.
+# -no-CApath/-no-CAstore keep OpenSSL's default locations (the host's /etc/ssl) out of it.
+em_verify() {
+  local ca=$1 n c
+  shift
+  (( $# )) || set -- $(em_names)
+  for n in "$@"; do
+    c=$CAH_EMUDHRA_DIR/$n$EM_SUFFIX.pem
+    openssl verify -attime "$CAH_EMUDHRA_ATTIME" -purpose sslserver -no-CApath -no-CAstore \
+      -CAfile "$ca" -untrusted "$c" "$c" >/dev/null 2>&1 && echo "$n"
+  done
+}
+
+# em_summary <file with accepted names>: "7/14 (g3: 0/7, aaa: 7/7, noct: 1/2)", or "0/14".
+# g3 = via emSign Root TLS CA - G3 / emSign ECC Root CA - G3, aaa = via the AAA Certificate
+# Services cross-sign, noct = the two leaves without SCTs (a subset of both).
+em_summary() {
+  awk 'NR == FNR { all[$0] = 1; t++; if ($0 ~ /-aaa/) ta++; else tg++; if ($0 ~ /-noct/) tn++; next }
+       ($0 in all) && !seen[$0]++ { n++; if ($0 ~ /-aaa/) a++; else g++; if ($0 ~ /-noct/) nc++ }
+       END { if (n) printf "%d/%d (g3: %d/%d, aaa: %d/%d, noct: %d/%d)", n, t, g, tg, a, ta, nc, tn
+             else printf "0/%d", t }' <(em_names) "$1"
+}
+
+# em_store <file> <scratch>: sets EM_CA to a PEM file `openssl verify -CAfile` can use for the
+# trust store <file> and EM_KIND to its kind. A PEM bundle is used as is (TRUSTED CERTIFICATE
+# blocks keep their trust rules); a Java keystore is exported with `keytool -list -rfc`, without a
+# password first (how the JDK opens cacerts), then with changeit. Returns 1 when no certificate
+# can be read (a binary with compiled-in DER roots, a DER file, an unreadable keystore).
+EM_CA= EM_KIND=
+em_store() {
+  local f=$1 dst=$2
+  EM_CA= EM_KIND=
+  if is_keystore "$f"; then
+    EM_KIND=keystore EM_CA=$dst
+    keytool -list -rfc -keystore "$f" </dev/null > "$dst" 2>/dev/null
+    if ! grep -q -- '-----BEGIN CERTIFICATE-----' "$dst"; then
+      keytool -list -rfc -keystore "$f" -storepass changeit </dev/null > "$dst" 2>/dev/null
+      EM_KIND="keystore (password changeit)"
+    fi
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$dst"
+  else
+    EM_KIND=pem EM_CA=$f
+    grep -Eq -- '-----BEGIN (TRUSTED )?CERTIFICATE-----' "$f"
+  fi
+}
+
+# Certificate-verification failures in a shim's output; anything else is ERROR, not REFUSED.
+# Keep in sync with the grep in lib/behave.nix (not shared, so the behavioral cells stay cached).
+CAH_REFUSAL_RE='certificate verify failed|CERTIFICATE_VERIFY_FAILED|unable to get local issuer|PKIX path|unable to find valid certification path|self[- ]signed certificate|unknown ca|certificate (is )?not trusted|untrusted|SSLHandshakeException|server certificate verification failed|x509: certificate signed by unknown authority|SSL certificate problem|BADCERT_NOT_TRUSTED'

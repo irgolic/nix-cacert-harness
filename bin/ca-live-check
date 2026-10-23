@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# ca-live-check: connect to the live eMudhra test hosts with the package's own trust store, before
+# and after the fix. NEEDS NETWORK and is NOT reproducible offline (everything else here is).
+#
+#   ca-live-check [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--shim NAME|FILE]
+#                 [--hosts dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa] [--sides "before after"]
+#                 [--timeout SEC] [--no-system-store] [--force-build] [--dry-run-only] ATTR
+#
+# https://emudhra.we-have-a-problem.com/ runs test hosts whose leaves are issued by the compromised
+# eMudhra intermediates: <kind>-<gen> chains to emSign ECC Root CA - G3, <kind>-<gen>-aaa to the AAA
+# Certificate Services cross-sign; cacert 3.131.1 trusts neither for TLS. For each side this builds
+# (cached, through nixb) a small wrapper (lib/live.nix: the shim's script for the stock package, the
+# shim's inputs on PATH) and runs it ON THE HOST, outside any sandbox, once per host against
+# https://<host>-emudhra.we-have-a-problem.com/, under `env -i` (no SSL_CERT_FILE, NIX_SSL_CERT_FILE,
+# SSL_CERT_DIR; HOME and TMPDIR in a fresh directory), so the package's own store decides.
+# Expected:  before  CONNECTED on at least one host     after  REFUSED on every host
+# Before that, one control handshake per host (openssl s_client and one GET): the host is up and
+# serves the chain in fixtures/emudhra, and the after side's cacert rejects that chain.
+# --no-system-store also hides the host's /etc/ssl and /etc/pki (bwrap, network unchanged), for
+# programs that read the system store before their own (Julia's NetworkOptions does).
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+pr= base= after= overlay= shim_arg= shim= sides="before after" force=0 dry_only=0 nosys=0 tmo=10 attr=
+hosts=dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa
+while (( $# )); do
+  case $1 in
+    --base) base=$2; shift 2 ;;
+    --after) after=$2; shift 2 ;;
+    --pr) pr=$2; shift 2 ;;
+    --after-overlay) overlay=$(readlink -f "$2"); shift 2 ;;
+    --shim) shim_arg=$2; shift 2 ;;
+    --hosts) hosts=$2; shift 2 ;;
+    --sides) sides=$2; shift 2 ;;
+    --timeout) tmo=$2; shift 2 ;;
+    --no-system-store) nosys=1; shift ;;
+    --force-build) force=1; shift ;;
+    --dry-run-only) dry_only=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) attr=$1; shift ;;
+  esac
+done
+[[ -n $attr ]] || die "usage: ca-live-check [options] ATTR"
+
+# Shim: --shim FILE or NAME, else shims/ATTR.{nix,sh}; shims/live/ holds shims that are only meant
+# for this check (they are not picked up by ca-check's behavioral matrix).
+cands=()
+if [[ -n $shim_arg ]]; then
+  if [[ -f $shim_arg ]]; then cands=("$shim_arg")
+  else for d in shims shims/live; do cands+=("$CAH_HOME/$d/$shim_arg.nix" "$CAH_HOME/$d/$shim_arg.sh" "$CAH_HOME/$d/$shim_arg"); done; fi
+else
+  for d in shims shims/live; do cands+=("$CAH_HOME/$d/$attr.nix" "$CAH_HOME/$d/$attr.sh"); done
+fi
+for c in "${cands[@]}"; do [[ -f $c ]] && { shim=$(readlink -f "$c"); break; }; done
+[[ -n $shim ]] || die "no shim for $attr (looked for shims/$attr.{nix,sh} and shims/live/$attr.{nix,sh}; pass --shim NAME|FILE)"
+
+IFS=, read -r -a H <<<"$hosts"
+for h in "${H[@]}"; do
+  [[ -f $CAH_EMUDHRA_DIR/$h$EM_SUFFIX.pem ]] || die "--hosts: no fixtures/emudhra/$h$EM_SUFFIX.pem (known: $(em_names | paste -sd' '))"
+done
+
+mkdir -p "$CAH_OUT"
+if [[ -n $pr ]]; then pr_out=$(cah_pr "$pr") || exit 2; read -r base after <<<"$pr_out"; fi
+if [[ -z $base && -n $after ]]; then base=$(cah_parent_of "$after") || exit 2; fi
+if [[ -z $base ]]; then base=$(cah_resolve_base) || exit 2; fi
+before_src=$(cah_base_src "$base") || exit 2
+after_src=$(cah_after_src "$after") || exit 2
+mapfile -d '' AFTER < <(cah_side_args "$after_src" "$overlay")
+tools=$(cah_tools "$before_src") || die "could not build harness tools"
+export PATH="$tools/bin:$PATH"
+timeout_bin=$(command -v timeout) || die "timeout (coreutils) not found"
+
+W=$CAH_OUT/$attr/live; rm -rf "$W"; mkdir -p "$W"
+echo "=================================================================="
+echo "LIVE $attr: needs network; NOT reproducible offline (the static and behavioral checks are)"
+echo "before: ${base}   after: ${after:-worktree $CAH_REPO}${overlay:+ + overlay ${overlay##*/}}"
+echo "shim: ${shim#"$CAH_HOME"/}   hosts: https://<host>$EM_SUFFIX/, one request per host per side, ${tmo}s timeout"
+
+# --- wrappers -----------------------------------------------------------------------------------
+own_re='(ca-live-|nss-cacert-|ca-tls-probe|ca-harness-|-env\.drv$|shim\.sh)'
+declare -A WRAP=() STATUS=() RES=()
+for side in $sides; do
+  if [[ $side == before ]]; then src=$before_src ov=""; else src=$after_src ov=$overlay; fi
+  largs=(-f "$CAH_HOME/lib/live.nix" --argstr src "$src" --argstr overlay "$ov" --argstr toolsSrc "$before_src"
+         --argstr attr "$attr" --argstr shim "$shim")
+  cah_dry_run "$W/$side.to-build" "${largs[@]}"
+  grep -Ev "$own_re" "$W/$side.to-build" > "$W/$side.to-build.pkg" || true
+  nb=$(grep -c . "$W/$side.to-build.pkg")
+  pol=$(cah_build_policy "$W/$side.to-build.pkg")
+  if (( dry_only )); then STATUS[$side]="dry-run only ($nb package drvs to build; policy: $pol)"; continue; fi
+  if [[ $pol != ok && $force == 0 ]]; then STATUS[$side]="SKIPPED ${pol#heavy:}"; continue; fi
+  t0=$SECONDS
+  if WRAP[$side]=$(cah_realise "${largs[@]}" 2>"$W/$side.build.log" | tail -1) && [[ -x ${WRAP[$side]} ]]; then
+    STATUS[$side]="ok ($nb package drvs built, $((SECONDS - t0))s)"
+  else
+    STATUS[$side]="BUILD FAILED (log: $W/$side.build.log)"; WRAP[$side]=
+  fi
+done
+for side in $sides; do printf '%-6s %s\n        wrapper %s\n' "$side" "${STATUS[$side]}" "${WRAP[$side]:-n/a}"; done
+if (( dry_only )); then echo "VERDICT $attr live: DRY-RUN (nothing built, no network)"; exit 0; fi
+
+# --- system store ---------------------------------------------------------------------------------
+hide=()
+if (( nosys )); then
+  bw=$(cah_realise -f "$before_src" bubblewrap 2>"$W/bwrap.log" | tail -1)
+  [[ -x $bw/bin/bwrap ]] || die "--no-system-store: could not build bubblewrap (see $W/bwrap.log)"
+  for d in /etc/ssl /etc/pki; do [[ -d $d ]] && hide+=(--tmpfs "$d"); done
+  "$bw/bin/bwrap" --dev-bind / / "${hide[@]}" -- true 2>"$W/bwrap.err" \
+    || die "--no-system-store: bwrap does not work here (unprivileged user namespaces?): $(head -1 "$W/bwrap.err")"
+  echo "system store: HIDDEN (--no-system-store: empty tmpfs over ${hide[*]//--tmpfs /}, network unchanged)"
+fi
+sys_stores=()
+for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+  [[ -f $f ]] && sys_stores+=("$f")
+done
+
+# --- controls: one handshake (and one GET) per host -------------------------------------------------
+cacert_out=$(cah_realise "${AFTER[@]}" 'cacert^out' 2>"$W/cacert.log" | head -1)
+[[ -d $cacert_out/etc/ssl/certs ]] || die "could not build the after side's cacert (see $W/cacert.log)"
+declare -A CTL=()
+ok_hosts=()
+for h in "${H[@]}"; do
+  fq=$h$EM_SUFFIX d=$W/control-$h fx=$CAH_EMUDHRA_DIR/$h$EM_SUFFIX.pem
+  mkdir -p "$d"
+  printf 'GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: nix-cacert-harness ca-live-check (control)\r\nConnection: close\r\n\r\n' "$fq" |
+    "$timeout_bin" -k 2 "$tmo" openssl s_client -connect "$fq:443" -servername "$fq" -showcerts -ign_eof \
+      -no-CAfile -no-CApath -no-CAstore > "$d/s_client.out" 2> "$d/s_client.err"
+  awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' "$d/s_client.out" > "$d/served.pem"
+  awk '/-----BEGIN CERTIFICATE-----/ {b = ""} {b = b $0 "\n"} /-----END CERTIFICATE-----/ {last = b} END {printf "%s", last}' \
+    "$d/served.pem" > "$d/top.pem"
+  if [[ ! -s $d/served.pem ]]; then CTL[$h]="UNREACHABLE ($(grep -m1 -v '^Connecting' "$d/s_client.err" | cut -c1-100))"; continue; fi
+  status=$(grep -m1 -aE '^HTTP/[0-9.]+ [0-9]{3}' "$d/s_client.out" | cut -d' ' -f2)
+  nserved=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$d/served.pem")
+  if [[ $(pem_fps "$d/served.pem" | cut -f1) != "$(pem_fps "$fx" | cut -f1)" ]]; then
+    CTL[$h]="CHAIN DIFFERS from fixtures/emudhra/${fx##*/} (see $d/served.pem)"; continue
+  fi
+  top_issuer=$(openssl x509 -in "$d/top.pem" -noout -issuer -nameopt RFC2253 | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+  if ! openssl verify -purpose sslserver -verify_hostname "$fq" -partial_chain -no-CApath -no-CAstore \
+       -CAfile "$d/top.pem" -untrusted "$d/served.pem" "$d/served.pem" > "$d/valid.log" 2>&1; then
+    CTL[$h]="SERVED CHAIN INVALID ($(grep -m1 error "$d/valid.log" | cut -c1-100))"; continue
+  fi
+  stock=rejects
+  for b in ca-bundle.crt ca-no-trust-rules-bundle.crt; do
+    openssl verify -purpose sslserver -no-CApath -no-CAstore -CAfile "$cacert_out/etc/ssl/certs/$b" \
+      -untrusted "$d/served.pem" "$d/served.pem" >/dev/null 2>&1 && stock="ACCEPTS (via $b)"
+  done
+  if [[ $stock != rejects ]]; then CTL[$h]="STOCK CACERT $stock the served chain"; continue; fi
+  sys=""
+  if (( ! nosys )); then
+    for f in "${sys_stores[@]}"; do
+      openssl verify -purpose sslserver -no-CApath -no-CAstore -CAfile "$f" -untrusted "$d/served.pem" "$d/served.pem" \
+        >/dev/null 2>&1 && sys="$sys ${f}"
+    done
+  fi
+  CTL[$h]="ok: HTTP ${status:-?}, served chain == fixtures/emudhra/${fx##*/} ($nserved certs, valid for the host up to $top_issuer), stock cacert rejects it"
+  [[ -n $sys ]] && CTL[$h]="${CTL[$h]}; WARNING: the host's system store ACCEPTS it:$sys"
+  ok_hosts+=("$h")
+done
+if (( ! nosys )); then
+  if (( ${#sys_stores[@]} )); then
+    acc=$(for h in "${ok_hosts[@]}"; do [[ ${CTL[$h]} == *WARNING* ]] && echo "$h"; done | paste -sd,)
+    echo "system store: visible: $(for f in "${sys_stores[@]}"; do printf '%s -> %s ' "$f" "$(readlink -f "$f" | sed 's|^/nix/store/[a-z0-9]\{32\}-||')"; done)"
+    echo "              ${acc:+ACCEPTS the served chain of $acc: a CONNECTED there may come from it, not from the package}${acc:-rejects every served chain, so it cannot make a cell CONNECTED}"
+  else
+    echo "system store: none found in /etc/ssl or /etc/pki"
+  fi
+fi
+for h in "${H[@]}"; do echo "control $h: ${CTL[$h]}"; done
+
+# --- the cells ------------------------------------------------------------------------------------
+redflag=()
+for side in $sides; do
+  for h in "${H[@]}"; do
+    if [[ -z ${WRAP[$side]:-} ]]; then RES[$side-$h]="${STATUS[$side]%% *}"; continue; fi
+    if [[ ${CTL[$h]} != ok* ]]; then RES[$side-$h]="no-control"; continue; fi
+    fq=$h$EM_SUFFIX d=$W/$side-$h
+    mkdir -p "$d/home" "$d/tmp"
+    cmd=(env -i HOME="$d/home" TMPDIR="$d/tmp" URL="https://$fq/" HOST="$fq" PORT=443
+         "$timeout_bin" -k 5 "$tmo" "${WRAP[$side]}")
+    (( nosys )) && cmd=("$bw/bin/bwrap" --dev-bind / / "${hide[@]}" -- "${cmd[@]}")
+    "${cmd[@]}" > "$d/shim.log" 2>&1
+    rc=$?
+    echo "$rc" > "$d/rc"
+    if (( rc == 0 )); then r=CONNECTED
+    elif grep -Eiq "$CAH_REFUSAL_RE" "$d/shim.log"; then r=REFUSED
+    elif (( rc == 124 || rc == 137 )); then r="ERROR(timeout)"
+    else r="ERROR(rc $rc)"
+    fi
+    RES[$side-$h]=$r
+    printf '  %-6s %-11s %-14s | %s\n' "$side" "$h" "$r" "$(grep -v '^[[:space:]]*$' "$d/shim.log" | tail -1 | cut -c1-150)"
+    [[ $side == after && $r == CONNECTED ]] && redflag+=("$h")
+  done
+done
+
+echo
+printf '%s  (live; before %s, after %s%s)\n' "$attr" "$base" "${after:-worktree}" "${overlay:+ + ${overlay##*/}}"
+printf '%-8s' ""; for h in "${H[@]}"; do printf ' | %-14s' "$h"; done; echo
+for side in $sides; do
+  printf '%-8s' "$side"; for h in "${H[@]}"; do printf ' | %-14s' "${RES[$side-$h]:-}"; done; echo
+done
+
+# --- verdict --------------------------------------------------------------------------------------
+cnt() {  # <side> <result-prefix>: CNT = number of control-ok hosts with that result, CNT_NAMES = them
+  local h; CNT=0 CNT_NAMES=
+  for h in "${ok_hosts[@]}"; do
+    [[ ${RES[$1-$h]:-} == "$2"* ]] && { CNT=$((CNT + 1)); CNT_NAMES+=${CNT_NAMES:+,}$h; }
+  done
+}
+nh=${#ok_hosts[@]}
+cnt after CONNECTED; a_conn=$CNT a_conn_n=$CNT_NAMES
+cnt after ERROR; a_err=$CNT a_err_n=$CNT_NAMES
+cnt before CONNECTED; b_conn=$CNT b_conn_n=$CNT_NAMES
+cnt before REFUSED; b_ref=$CNT
+note=""; (( nh < ${#H[@]} )) && note=" ($(( ${#H[@]} - nh )) host(s) without a working control left out)"
+if (( nh == 0 )); then
+  verdict="INVALID: no host passed the control (unreachable, or not serving the fixture chain); see the control lines"
+elif [[ $sides == *after* && -z ${WRAP[after]:-} ]] || [[ $sides == *before* && -z ${WRAP[before]:-} ]]; then
+  verdict="INCOMPLETE (a side was not built: $(for s in $sides; do [[ -z ${WRAP[$s]:-} ]] && printf '%s %s; ' "$s" "${STATUS[$s]}"; done))"
+  (( a_conn )) && verdict="$verdict RED FLAG: after CONNECTED to $a_conn_n"
+elif (( a_conn )); then
+  verdict="FAIL: the after side CONNECTED to $a_conn/$nh host(s) serving a compromised eMudhra chain ($a_conn_n)$note"
+elif (( a_err )); then
+  verdict="ERROR: the after side gave no certificate verdict on $a_err_n (see $W/after-<host>/shim.log)$note"
+elif [[ $sides != *before* ]]; then
+  verdict="PASS (after only): REFUSED on all $nh host(s)$note"
+elif (( b_conn )); then
+  verdict="PASS: before CONNECTED to $b_conn/$nh host(s) serving a compromised eMudhra chain ($b_conn_n); after REFUSED on all $nh$note"
+elif (( b_ref == nh )); then
+  verdict="INCONCLUSIVE-BEFORE: before was REFUSED on all $nh host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all $nh$note"
+else
+  verdict="INCONCLUSIVE-BEFORE: before did not connect anywhere (some cells ERROR, see $W/before-<host>/shim.log); after REFUSED on all $nh$note"
+fi
+echo "VERDICT $attr live: $verdict"
+(( ${#redflag[@]} )) && echo "RED FLAG $attr: after side CONNECTED to ${redflag[*]}" >&2
+exit 0

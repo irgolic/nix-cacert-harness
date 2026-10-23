@@ -2,12 +2,17 @@
 # ca-check ATTR [options]: approach 1 always, approach 2 when shims/ATTR.{nix,sh} exists.
 # Options are passed to both (e.g. --base REV, --after-overlay FILE, --force-build), except the
 # behavioral-only --shim NAME|FILE, --sides and --rerun. --shim also runs approach 2 when shims/ATTR does not exist.
+# --emudhra (opt-in; without it nothing changes): the static check with the offline eMudhra chain
+# verification, then bin/ca-live-check against the live eMudhra test hosts, and NO synthetic-root
+# matrix. --hosts, --timeout and --no-system-store go to ca-live-check only.
 set -uo pipefail
 here=$(dirname "$(readlink -f "$0")")
 if [[ $# -eq 0 || $1 == -h || $1 == --help ]]; then
   cat <<EOF
 usage: ca-check ATTR [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--force-build] [--dry-run-only]
                      [--shim NAME|FILE] [--sides "before after"] [--rerun]
+       ca-check ATTR --emudhra [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--force-build]
+                     [--shim NAME|FILE] [--hosts dv-g3b,dv-g3b-aaa,...] [--timeout SEC] [--no-system-store]
 
 Reviewing a PR, no checkout needed:
   nix run github:irgolic/nix-cacert-harness -- ATTR --pr N          # NixOS/nixpkgs PR: base and head from GitHub
@@ -18,20 +23,43 @@ origin/master or master, and "after" to the working tree. Results and logs go to
 \${XDG_CACHE_HOME:-~/.cache}/nix-cacert-harness. Builds are bounded (3 at a time, 4 cores each).
 --shim NAME runs the behavioral check with shims/NAME.nix (or .sh) of this harness, e.g.
 --shim python-wheel tests the wheel in the dist output instead of the installed package.
+
+--emudhra replaces the synthetic-root matrix with the eMudhra incident's own certificates:
+  1. static check + every store verified against the 14 chains in fixtures/emudhra
+     (offline, reproducible; its own table and "VERDICT ATTR emudhra:" line), then
+  2. ca-live-check: the package's shim, outside any sandbox, against the live test hosts
+     https://<host>-emudhra.we-have-a-problem.com/ (needs network, NOT reproducible offline;
+     "VERDICT ATTR live:"). Default hosts dv-g3b,dv-g3b-aaa,dv-g3c,dv-g3c-aaa.
 EOF
   exit 0
 fi
 attr=$1; shift
 # ca-static-check does not know the behavioral-only options (it would take them for attrs).
-common=() behave=() shim=
+common=() behave=() live=() liveonly=() shim= emudhra=0
 while (( $# )); do
   case $1 in
-    --shim) shim=$2; behave+=("$1" "$2"); shift 2 ;;
-    --sides) behave+=("$1" "$2"); shift 2 ;;
+    --shim) shim=$2; behave+=("$1" "$2"); live+=("$1" "$2"); shift 2 ;;
+    --sides) behave+=("$1" "$2"); live+=("$1" "$2"); shift 2 ;;
     --rerun) behave+=("$1"); shift ;;
+    --emudhra) emudhra=1; shift ;;
+    --hosts|--timeout) liveonly+=("$1" "$2"); shift 2 ;;
+    --no-system-store) liveonly+=("$1"); shift ;;
     *) common+=("$1"); shift ;;
   esac
 done
+if (( emudhra )); then
+  echo "[1/2] static check + eMudhra chains: offline, reproducible"
+  "$here/ca-static-check" --emudhra "${common[@]}" "$attr"
+  echo
+  echo "[2/2] live eMudhra test hosts: needs network, NOT reproducible offline"
+  if [[ -n $shim || -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh || -e $here/../shims/live/$attr.nix || -e $here/../shims/live/$attr.sh ]]; then
+    "$here/ca-live-check" "${common[@]}" "${live[@]}" "${liveonly[@]}" "$attr"
+  else
+    echo "(no shims/$attr.{nix,sh} or shims/live/$attr.{nix,sh}: live check skipped)"
+  fi
+  exit 0
+fi
+(( ${#liveonly[@]} == 0 )) || { echo "error: --hosts, --timeout and --no-system-store need --emudhra" >&2; exit 2; }
 "$here/ca-static-check" "${common[@]}" "$attr"
 if [[ -n $shim || -e $here/../shims/$attr.nix || -e $here/../shims/$attr.sh ]]; then
   echo; "$here/ca-behave-check" "${common[@]}" "${behave[@]}" "$attr"

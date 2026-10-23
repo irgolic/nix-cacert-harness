@@ -29,7 +29,7 @@
               chmod +x $out/libexec/bin/*
               patchShebangs $out/libexec/bin
               mkdir -p $out/bin
-              for tool in ca-check ca-static-check ca-behave-check nixb; do
+              for tool in ca-check ca-static-check ca-behave-check ca-live-check nixb; do
                 # nix and git are taken from the user's PATH on purpose (daemon/version match);
                 # everything else is pinned here.
                 makeWrapper $out/libexec/bin/$tool $out/bin/$tool \
@@ -82,6 +82,10 @@
         behave = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/ca-behave-check";
+        };
+        live = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/ca-live-check";
         };
       });
 

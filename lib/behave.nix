@@ -16,7 +16,13 @@ let
   pkgs = import src { overlays = if overlay == "" then [ ] else [ (import overlay) ]; };
   tools = import toolsSrc { overlays = [ ]; };
   inherit (pkgs) lib;
-  fx = builtins.path { path = /. + fixtures; name = "ca-harness-fixtures"; };
+  # fixtures/emudhra (the eMudhra chains of ca-static-check --emudhra and ca-live-check) is left
+  # out, so the cells' fixture path, the test-root cacert and every cached cell stay as they were.
+  fx = builtins.path {
+    path = /. + fixtures;
+    name = "ca-harness-fixtures";
+    filter = p: _: baseNameOf p != "emudhra";
+  };
 
   pkg0 = lib.getAttrFromPath (lib.splitString "." attr) pkgs;
   cacertTest = pkgs.cacert.override { extraCertificateFiles = [ "${fx}/root.pem" ]; };
@@ -28,13 +34,7 @@ let
   defaultInject =
     p: c: if (lib.functionArgs (p.override or (_: { }))) ? cacert then p.override { cacert = c; } else p;
 
-  probes = {
-    java = tools.runCommand "ca-tls-probe-java" { nativeBuildInputs = [ tools.jdk_headless ]; } ''
-      mkdir -p $out
-      cp ${../probes/TlsProbe.java} TlsProbe.java
-      javac --release 8 -Xlint:-options -d $out TlsProbe.java
-    '';
-  };
+  probes = import ./probes.nix { inherit tools; };
 
   shimPath = /. + shim;
   shimFn =
