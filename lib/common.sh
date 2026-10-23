@@ -258,7 +258,13 @@ em_store() {
     grep -q -- '-----BEGIN CERTIFICATE-----' "$dst"
   else
     EM_KIND=pem EM_CA=$f
-    grep -Eq -- '-----BEGIN (TRUSTED )?CERTIFICATE-----' "$f"
+    # A PEM header alone is not enough: binaries such as JCEF's libcef.so contain the string but no
+    # certificate, and openssl verify then fails every chain ("accepted 0/14"). At least one
+    # certificate must parse.
+    grep -Eq -- '-----BEGIN (TRUSTED )?CERTIFICATE-----' "$f" || return 1
+    local n
+    n=$(pem_fps "$f" 2>/dev/null | grep -c .)
+    (( n > 0 ))
   fi
 }
 
