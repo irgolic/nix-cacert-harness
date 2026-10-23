@@ -2368,3 +2368,55 @@ before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
 after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
 VERDICT renpy live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
 ```
+
+### gnustep-base: static FIXED, eMudhra FIXED (7/14 → 0/14, via AAA), live PASS with server verification on
+
+The fix: `postInstall` replaces `$lib/lib/GNUstep/Libraries/gnustep-base/Versions/1.29/Resources/GSTLS/ca-certificates.crt`
+(the `lib` output; the version directory is `lib.versions.majorMinor`) with a symlink to cacert's `ca-bundle.crt`.
+The after side built in about 8 minutes (configure 3:04, build 3:58; nixb, 4 cores).
+
+- GSTLS (`Source/GSTLS.m`) takes its default CA file from the `GSTLSCAFile` user default, then `GS_TLS_CA_FILE`,
+  then `SSL_CERT_FILE`, then this file in the base library's resource bundle, and hands it to
+  `gnutls_certificate_set_x509_trust_file`. GnuTLS reads the trust-rules bundle as its 118 TLS roots (AAA
+  Certificate Services is not among them), as checked earlier with `certtool`/`gnutls-cli`.
+- GNUstep does not verify server certificates by default (`GSTLSVerifyServer` / `GS_TLS_VERIFY_S`, or the
+  per-request `GSTLSVerify`). `shims/live/gnustep-base.nix` turns it on with `GS_TLS_VERIFY_S=YES`; it builds a
+  small Objective-C client against the side's gnustep-base (wrapped by `wrapGNUstepAppsHook`, so the resource
+  bundle resolves) that prints the CA file GSTLS resolves and does one `NSURLConnection` GET.
+
+```
+$ nix run github:irgolic/nix-cacert-harness -- gnustep-base --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --emudhra
+| lib:/lib/GNUstep/Libraries/gnustep-base/Versions/1.29/Resources/GSTLS/ca-certificates.crt | pem 180 certs: 157 not in cacert, 15 in cacert but not for TLS, 110 cacert TLS roots missing; scanner: AAA | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT gnustep-base: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+| lib:/lib/GNUstep/Libraries/gnustep-base/Versions/1.29/Resources/GSTLS/ca-certificates.crt | pem: accepted 7/14 (g3: 0/7, aaa: 7/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT gnustep-base emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 0/7, aaa: 7/7, noct: 1/2); after 0/14
+  before dv-g3b      REFUSED        | error: TLS verification: remote certificate is not trusted.
+  before dv-g3b-aaa  CONNECTED      | status 200
+  after  dv-g3b-aaa  REFUSED        | error: TLS verification: remote certificate is not trusted.
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | REFUSED        | CONNECTED      | REFUSED        | CONNECTED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT gnustep-base live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b-aaa,dv-g3c-aaa); after REFUSED on all 4
+```
+
+### pgsql-tools: static FIXED, eMudhra FIXED (7/14 → 0/14); no live shim
+
+The fix: `postInstall` replaces `lib/pgsql-tools/_internal/certifi/cacert.pem` (PyInstaller tree of the
+upstream binary release) with a symlink to cacert's `ca-bundle.crt`. The rebuild is unpack, copy and
+autoPatchelf only.
+
+- A scan of the PYZ archive (`PyInstaller.archive.readers`) finds the `certifi` users: `requests` (so
+  `azure-core`/`azure-identity`/`msal`, the Entra ID token requests), `httpx`/`httpcore` (`openai` under
+  `semantic-kernel`) and `httplib2`. There is no `pyi_rth_certifi` runtime hook, so `SSL_CERT_FILE` is not set
+  from it. PostgreSQL connections themselves use libpq's `sslrootcert`, not this file.
+- No live shim: the program is a JSON-RPC service for the VS Code PostgreSQL extension, its HTTPS calls go to
+  fixed Microsoft endpoints after a sign-in, and a PyInstaller binary cannot run a snippet. Also,
+  `ossdbtoolsservice_main --help` exits with SIGSEGV on this machine, before and after the change alike.
+
+```
+$ nix run github:irgolic/nix-cacert-harness -- pgsql-tools --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --emudhra
+| out:/lib/pgsql-tools/_internal/certifi/cacert.pem | pem 145 certs: 22 not in cacert, 12 in cacert but not for TLS, 7 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT pgsql-tools: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+| out:/lib/pgsql-tools/_internal/certifi/cacert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT pgsql-tools emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+```

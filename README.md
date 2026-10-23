@@ -129,7 +129,7 @@ lib/live.nix             the runnable wrapper of ca-live-check (shim script + it
 lib/probes.nix           the Java probe, shared by behave.nix and live.nix
 probes/TlsProbe.java     HTTPS probe for any JVM (compiled with --release 8)
 shims/                   per-package "make it do one HTTPS GET to $URL" snippets
-shims/live/              shims used only by ca-live-check (olvid, frostwire-bin), not by the behavioral matrix
+shims/live/              shims used only by ca-live-check (olvid, frostwire-bin, renpy, gnustep-base), not by the behavioral matrix
 fixtures/                test root + leaf. The keys are public test material: never trust the root.
 fixtures/emudhra/        the 14 chains served by the eMudhra test hosts (public certificates; SOURCE.txt);
                          left out of the behavioral cells' fixture path
@@ -463,8 +463,9 @@ bin/ca-live-check [--pr N] [--base REV] [--after REV] [--after-overlay FILE] [--
     `/etc/ssl/certs/ca-certificates.crt` to its bundled `cert.pem`.
   - `--no-system-store` needs unprivileged user namespaces.
 - **Shims.** These are the behavioral check's shims (`shims/<attr>.{nix,sh}`). Shims meant only for this
-  check live in `shims/live/`, where `ca-check`'s behavioral matrix does not look. There are two so far:
-  `olvid` and `frostwire-bin`, which run the probe on the JVM their launchers actually exec.
+  check live in `shims/live/`, where `ca-check`'s behavioral matrix does not look: `olvid` and `frostwire-bin`
+  (the probe on the JVM their launchers actually exec), `renpy` (the SDK's bundled Python interpreter,
+  through nixpkgs' dynamic loader) and `gnustep-base` (a small Objective-C client, `GS_TLS_VERIFY_S=YES`).
 - `--after-overlay` works as elsewhere (the wrapper imports the side's nixpkgs with the overlay).
 
 ```
