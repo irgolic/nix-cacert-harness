@@ -2468,3 +2468,23 @@ the sandboxed cells there is no `/etc/ssl`, so the embedded list alone decides; 
 with the host's store, as on any NixOS machine. The live run is without `--no-system-store`: the host's store
 does not hold emSign ECC Root CA - G3 as a plain certificate, so the G3 connections before the fix come from
 the embedded list.
+
+### autopsy: no change needed for the PEM bundles (#576541); all of them are in Windows-only trees
+
+Scanner (pinned) on the cached `autopsy-4.23.1` output, PEM bundles and executables only:
+
+```
+/autopsy/plaso/plaso-20180818-amd64/certifi/cacert.pem                 121 known roots  AAA Certificate Services
+/autopsy/gstreamer/1.0/x86_64/etc/ssl/certs/ca-certificates.crt        108 known roots  AAA Certificate Services
+/autopsy/modules/ext/jython-standalone-2.7.4.jar!Lib/ensurepip/_bundled/pip-19.1-py2.py3-none-any.whl!pip/_vendor/certifi/cacert.pem  134  AAA, emSign x4
+/bin/autopsy-mcp-stdio.exe                                             127 known roots  AAA, emSign x4
+```
+
+- `plaso-20180818-amd64` is a frozen Windows build (`*.exe`, `*.pyd`). `PlasoIngestModule.startUp()` throws
+  `Plaso module requires windows.` when `!PlatformUtil.isWindowsOS()`.
+- `gstreamer/1.0/x86_64` is a Windows GStreamer (`*.dll`, mingw `.a`). `Installer.loadDynLibraries()` calls
+  `addGstreamerPathsToEnv()` only inside `if (PlatformUtil.isWindowsOS())`; elsewhere the system GStreamer is assumed.
+- The jython jar's pip wheel is an archive member (#576542 class), used only by Jython's `ensurepip`;
+  `autopsy-mcp-stdio.exe` is a Windows executable. The `google-api-client` keystores are #576542 too.
+
+So nothing in these files is reachable on Linux; no static/eMudhra run, because there is no change.
