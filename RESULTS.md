@@ -2090,6 +2090,7 @@ Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
 | jabref | `bc5739d29` | yes | 250 s (+ 261 s for the test-root build) | ~12.6 GB (test-root build ~10.6 GB) | FIXED (+ archives) | FIXED: 7/14 (aaa) → 0/14 | PASS (before CONN g3b-aaa, g3c-aaa) |
 | jetbrains.jdk (JCEF) | `34f61387b` | yes | 894 s | ~8.3 GB | NOT FIXED (JCEF's `libcef.so` only) | FIXED: 14/14 → 0/14 | PASS (before CONN ×4) |
 | eddie | `1ed46a6c3` | **no**: both sides fail in a dependency (PowerShell 7.0.0 nupkg, patchelf abort) | - | ~6.0 GB (fetches, failed builds) | INCOMPLETE | INCOMPLETE | skipped (GUI, no shim) |
+| gpac | `13307d886` | yes | 130 s | ~0.6 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (the default build has no TLS; see below) |
 
 ### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
 
@@ -2184,3 +2185,29 @@ VERDICT eddie emudhra: INCOMPLETE (a side was not built)
 The breakage is in nixpkgs at the base, and the fix does not touch it. eddie is a GUI (`eddie-ui`), so
 there is no live shim. The run took 2:48; free space dropped by about 6 GB (the nupkg and mono fetches, and the
 failed builds, whose build dirs nix removed).
+
+### gpac: static FIXED, eMudhra FIXED (14/14 → 0/14); no live check, because the default build has no TLS
+
+`--after 13307d8861cdf3f4db441c3afffeb3080e84b1ef` (`cacert/gpac`; `postInstall` replaces
+`share/gpac/res/ca-bundle.crt` with a symlink to cacert's `ca-bundle.crt`). The after side was built in 130 s,
+with a peak of ~0.6 GB, and the run took 4:00. The base output was already in the store.
+
+```
+| out:/share/gpac/res/ca-bundle.crt | pem 147 certs: 26 not in cacert, 18 in cacert but not for TLS, 15 cacert TLS roots missing; scanner: AAA,ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT gpac: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+| out:/share/gpac/res/ca-bundle.crt | pem: accepted 14/14 (g3: 7/7, aaa: 7/7, noct: 2/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT gpac emudhra: FIXED: before accepted 14/14 compromised eMudhra chains (g3: 7/7, aaa: 7/7, noct: 2/2); after 0/14
+```
+
+Why there is no live shim:
+- The `gpac` attribute (`withFullDeps ? false`) has only `zlib` in `buildInputs`. Its outputs reference
+  only zlib and glibc (and, after the fix, nss-cacert), and `libgpac.so` has no `SSL_CTX_new` or
+  `curl_easy_init`. Neither `gpac` nor `MP4Box` in this build can open an `https://` URL.
+- The vendored file is only read by a `gpac.override { withFullDeps = true; }` build (openssl and curl
+  in `buildInputs`). Even there it is the fallback `core:ca-bundle-default`
+  (`src/utils/os_config_init.c`: `<share>/res/ca-bundle.crt`).
+  - `downloader_ssl.c` and `downloader_curl.c` use it only when no `-ca-bundle` option is set and
+    OpenSSL's default cert file (`$SSL_CERT_FILE`, else the compiled-in path) or libcurl's CA bundle does not exist.
+  - The OpenSSL path calls `SSL_CTX_set_default_verify_paths` first in any case.
+- The full-deps variant is not a nixpkgs attribute and was not built here.
