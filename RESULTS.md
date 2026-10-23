@@ -2094,6 +2094,7 @@ Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
 | linphonePackages.liblinphone | `874cd910f` | yes | 285 s (and a python3 env) | ~0.35 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (no usable CLI; see below) |
 | supertuxkart | `86431c7a1` | yes | 388 s | ~1.5 GB (incl. the 0.8 GB base output fetched) | FIXED | FIXED: 14/14 → 0/14 | skipped (game) |
 | itgmaniaPackages.itgmania-unwrapped (and `itgmania`) | `cd1d84bca` | yes, both sides (unfree, not cached) | 686 s (before: 691 s) | ~2.0 GB | FIXED | FIXED: 14/14 → 0/14 | skipped (game) |
+| julia (1.13.2 from source) | `6662a5f54` | yes, install check (test suite) passed | 7418 s (build 1:29:17, test suite 31:47) | ~13.5 GB (incl. 1.0 GB output and 0.76 GB of fetched inputs) | FIXED | FIXED: 7/14 (g3) → 0/14 | PASS with `--shim julia-bin --no-system-store` (before CONN g3b, g3c) |
 
 ### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
 
@@ -2292,3 +2293,45 @@ VERDICT itgmania emudhra: FIXED: before accepted 14/14 compromised eMudhra chain
 ```
 
 A game, so no live shim. Outputs: `runs/emudhra-itgmaniaPackages.itgmania-unwrapped.txt` and `runs/emudhra-itgmania.txt`.
+
+### julia (1.13.2, from source): built with its full install check; static FIXED, eMudhra FIXED, live PASS
+
+`--after 6662a5f54712919f60e96daec22e5812c338850e` (`cacert/julia`; `generic.nix` gets a `postInstall` that
+replaces `share/julia/cert.pem` with a symlink to cacert's `ca-bundle.crt`, the reviewer's trust-rules
+variant, see "julia: trust-rules bundle" above). `julia` is `julia_113`. Its base output is on
+cache.nixos.org; the after side is the real derivation, without the `fixes/julia-bin-skip-installcheck.nix`
+kind of overlay. It ran under a 3-hour cap, and nixb limits it to 4 cores.
+
+```
+$ nix run github:irgolic/nix-cacert-harness -- julia --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --after github:irgolic/nixpkgs/6662a5f54712919f60e96daec22e5812c338850e --emudhra --force-build --shim julia-bin --no-system-store
+after  ok (1 built, 7418s)
+| out:/share/julia/cert.pem | pem 121 certs: 3 not in cacert, 0 in cacert but not for TLS, 0 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT julia: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+| out:/share/julia/cert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT julia emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+
+  before dv-g3b      CONNECTED      | status 200
+  before dv-g3b-aaa  REFUSED        | ERROR: RequestError: SSL certificate OpenSSL verify result: unable to get local issuer certificate (20) while requesting https://dv-g3b-aaa-emudhra.we-have-a-pr
+  after  dv-g3b      REFUSED        | ERROR: RequestError: SSL certificate OpenSSL verify result: unable to get local issuer certificate (20) while requesting https://dv-g3b-emudhra.we-have-a-proble
+  after  dv-g3b-aaa  REFUSED        | ERROR: RequestError: SSL certificate OpenSSL verify result: certificate rejected (28) while requesting https://dv-g3b-aaa-emudhra.we-have-a-problem.com/
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT julia live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
+
+- **Build.** buildPhase 1:29:17 (deps from source, LLVM included, as `USE_BINARYBUILDER=0`), installPhase
+  34 s, installCheckPhase 31:47. The run took 2:05:07 in total.
+- **Install check.** This is Julia's test suite with the package's skip list (`internet_required`,
+  `NetworkOptions`, ...), run against the fixed `$out`, i.e. with `cert.pem` already a symlink to `ca-bundle.crt`:
+  `Overall | 70193464 Pass, 448 Broken, 70193912 Total, 24m47.7s`, `SUCCESS`.
+- **Peak.** Free space dropped by ~13.5 GB. That includes the 1.03 GB output and the 757 MiB of fetched
+  inputs (gcc and gfortran 14, the `-full` source tarball).
+- **Live.** `--shim julia-bin` (the same script works for the from-source package) and `--no-system-store`.
+  As for julia-bin, the system store is hidden, because `NetworkOptions.ca_roots_path()` prefers it to the bundled
+  `cert.pem`.
+  - Before connected exactly to the G3 hosts, as the offline check predicts (the bundled file has emSign ECC
+    Root CA - G3, not AAA).
+  - After refused all four: `unable to get local issuer certificate` for G3, and `certificate rejected (28)` for
+    AAA, the e-mail-only trust rule in `ca-bundle.crt`.
+  - The before side is the cached julia-1.13.2, so this also extends the julia-bin result to the from-source attribute.
