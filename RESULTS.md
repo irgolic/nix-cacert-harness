@@ -1728,6 +1728,62 @@ VERDICT jabref: PASS: after-fix trust follows cacert; before-fix ignores it
 - Existing users keep their already-seeded `~/.local/share/jabref/ssl/truststore.jks`. JabRef only
   copies the resource when the file is missing.
 
+### jetbrains.jdk-no-jcef (fix branch, from source): static FIXED, behavioral PASS
+
+`--after 34f61387b674b95f752688a9c49f5cc7065f3bc0` (`cacert/jetbrains-jdk`, "jetbrains-jdk: generate cacerts
+from cacert"; the fix is in `common.nix`, so it covers `jetbrains.jdk`, `jdk-no-jcef` and the `-21`
+variants; only `jdk-no-jcef`, JBR 25.0.3-b508.4, was run through the harness). JBR is
+`jdk.overrideAttrs` with `dontConfigure = true`: JetBrains' `mkimages_x64.sh` runs OpenJDK's `configure`
+itself, so the `preConfigure` in which openjdk (#576518) generates `cacerts` never runs, and the image
+got JBR's own `make/data/cacerts`. The fix generates `$NIX_BUILD_TOP/cacerts-gen/cacerts` in buildPhase
+with `jre-generate-cacerts` (password-less PKCS12, as openjdk does) and appends
+`--with-cacerts-file=` for it to the flags it splices into `mkimages_x64.sh`.
+
+Dry-run of the after side: one derivation to build (`jetbrains-jdk-25.0.3-b508.4.drv`), three paths to
+fetch (323 MiB: the JBR source, `gtk-shell.xml`, `temurin-bin-25.0.4`, the boot JDK from jdk25's
+configure flags). The base output is on cache.nixos.org. Builds through `nixb` (4 cores, `--max-jobs
+1`), machine load up to ~19 on 16 cores, one at a time:
+
+| build | time | peak in the build-dir tmpfs |
+|---|---|---|
+| after (fix), `--force-build` through `nixb` with the disk watchdog | 14:24 (incl. the fetches) | ~6.1 GB (1.66 GB left of 7.7) |
+| after, test-root cacert (matrix) | ~16 min (matrix build 16:53 incl. the four cells) | ~6.0 GB (1.76 GB left) |
+| before (base) | fetched from the cache | - |
+
+The harness run took 19:25 in total (static check 2:32, the base fetched).
+
+```
+| out:/lib/openjdk/lib/security/cacerts | keystore 109 certs: 33 not in cacert, 17 in cacert but not for TLS, 59 cacert TLS roots missing [no-password]; scanner: AAA,ECC G3 | keystore 118 certs == cacert [no-password] |
+VERDICT jetbrains.jdk-no-jcef: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+
+         | stock cacert | + test root  | override with test-root cacert
+before   | REFUSED      | REFUSED      | NO-OP (package does not take cacert)
+after    | REFUSED      | CONNECTED    | yes (rebuilt with cacert + test root)
+control (before cells): curl --cacert test-root: CONNECTED, curl --cacert stock: REFUSED
+VERDICT jetbrains.jdk-no-jcef: PASS: after-fix trust follows cacert; before-fix ignores it
+```
+
+- Build log: 118 times `Certificate was added to keystore`, then `computed configure flags: ...
+  --with-cacerts-file=/build/cacerts-gen/cacerts` (the only `--with-cacerts-file`; jdk25's
+  `configureFlags` carry none, its flag is added in the skipped `preConfigure`), and configure's
+  `checking for cacerts file... /build/cacerts-gen/cacerts`. The test-root build: 119 certificates
+  added, same configure line.
+- Built store: `lib/openjdk/lib/security/cacerts`, PKCS12, `keytool -list -cacerts` without a password:
+  "Your keystore contains 118 entries"; its SHA-256 set equals cacert's `ca-no-trust-rules-bundle.crt`
+  (`fprs4zi8…-nss-cacert-3.131.1`, 118). Before: 109 entries, including AAA Certificate Services and
+  emSign ECC Root CA - G3.
+- Shim: `shims/jetbrains.jdk-no-jcef.nix`, `java-runtime.nix` plus an `inject`. A plain symlink to
+  `java-runtime.nix` does not work: `jetbrains-jdk/default.nix` declares neither `cacert` nor `...`
+  (it calls `common.nix` through its own `callPackage` argument), so the default injection reports
+  NO-OP on the after side (checked). The inject overrides that `callPackage` with one that also passes
+  `cacert` to functions that declare it, only when `common.nix` declares it. Checked by evaluation:
+  injecting the stock cacert reproduces the after drv exactly (`ypq1dhnz…`); the base gives a NO-OP.
+- Shim logs: `java.home=/nix/store/…-jetbrains-jdk-25.0.3-b508.4/lib/openjdk trustStore=(default)` in
+  every cell; the refusing cells end in `PKIX path building failed`, after-test prints `OK status=200
+  cipher=TLS_AES_256_GCM_SHA384`.
+- "cacert in runtime closure: no" on both sides is expected: the keystore is generated at build time.
+- Space: the build-dir tmpfs (see jabref above) was enough for one JBR build at a time, not two.
+
 ## eMudhra chains: offline (`--emudhra`) and live hosts (`ca-live-check`) (2026-10-23)
 
 Twelve fix branches checked against the certificates of the incident itself
@@ -1989,3 +2045,17 @@ after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
 VERDICT frostwire-bin live: INCONCLUSIVE-BEFORE: before was REFUSED on all 4 host(s) too (the program's runtime store never trusted these chains, e.g. it runs on the already-fixed openjdk); after REFUSED on all 4
 ```
 
+
+### jetbrains.jdk (with JCEF, fix branch): not built here, the build dir is too small
+
+Dry-run: one derivation to build (`jetbrains-jdk-jcef-25.0.3-b508.4.drv`), with `jcef-jetbrains-1207`
+(290 MiB download, 640 MiB unpacked) and thrift fetched; the base output is on cache.nixos.org. Since
+the no-jcef build took 14:24, I tried it, alone, through `nixb` with the disk watchdog. The watchdog
+stopped it 15:28 in, with 7.2 GB of the build-dir tmpfs used and 0.52 GB left. At that point JetBrains'
+`mkimages_x64.sh` had built both images and was writing the debug-info tarball
+`jbrsdk_jcef-25.0.3-linux-x64-b508.4_diz.tar.gz`; installPhase had not started. The JCEF variant
+copies jcef into the build tree and into both images, so it needs more than the ~7.7 GB this machine
+has free there. Its log shows the same wiring as no-jcef: 118 `Certificate was added to keystore`,
+`--with-cacerts-file=/build/cacerts-gen/cacerts` in the computed configure flags, and
+`checking for cacerts file... /build/cacerts-gen/cacerts`. The fix is the same `common.nix` code path
+for both attributes; the built-store evidence is from `jdk-no-jcef` only.
