@@ -2089,6 +2089,7 @@ Cleaned outputs: `runs/emudhra-<attr>.txt` in the gist.
 |---|---|---|---|---|---|---|---|
 | jabref | `bc5739d29` | yes | 250 s (+ 261 s for the test-root build) | ~12.6 GB (test-root build ~10.6 GB) | FIXED (+ archives) | FIXED: 7/14 (aaa) → 0/14 | PASS (before CONN g3b-aaa, g3c-aaa) |
 | jetbrains.jdk (JCEF) | `34f61387b` | yes | 894 s | ~8.3 GB | NOT FIXED (JCEF's `libcef.so` only) | FIXED: 14/14 → 0/14 | PASS (before CONN ×4) |
+| eddie | `1ed46a6c3` | **no**: both sides fail in a dependency (PowerShell 7.0.0 nupkg, patchelf abort) | - | ~6.0 GB (fetches, failed builds) | INCOMPLETE | INCOMPLETE | skipped (GUI, no shim) |
 
 ### jabref (in the sandbox): static FIXED, behavioral PASS, eMudhra FIXED, live PASS
 
@@ -2162,3 +2163,24 @@ VERDICT jetbrains.jdk live: PASS: before CONNECTED to 4/4 host(s) serving a comp
   sha256 `7944d45d…` before, `859ca64d…` after, not investigated). The JDK's own keystore is FIXED (118 == cacert).
 - Live shim: `shims/jetbrains.jdk.nix`, a symlink to `jetbrains.jdk-no-jcef.nix` (TlsProbe on the JBR's
   `java`). The live check prints the symlink target's name.
+
+### eddie: not buildable at the base or on the fix branch (a broken dependency), INCOMPLETE
+
+`--after 1ed46a6c30e7b99448a02acf0364d06145111327` (`cacert/eddie`; `postInstall` replaces
+`share/eddie-ui/cacert.pem` with a symlink to cacert's `ca-bundle.crt`). eddie is not on cache.nixos.org at
+the base, so both sides were built, and both failed the same way before reaching eddie itself. The chain is
+`eddie` ← `msbuild-16.10.1+xamarinxplat` ← `roslyn-4.14.0` ← `PowerShell-7.0.0` (a nupkg). Its
+`patch-nupkgs` step aborts in patchelf 0.19.2 on `powershell/7.0.0/tools/netcoreapp3.1/any/unix/pwsh`:
+
+```
+PowerShell> Patchelfing powershell/7.0.0/tools/netcoreapp3.1/any/unix/pwsh as powershell/7.0.0/tools/netcoreapp3.1/any/unix/pwsh.46.nix-patched
+PowerShell> patchelf: patchelf.cc:547: void ElfFile<...>::shiftFile(unsigned int, size_t, size_t) [with ...]: Assertion `splitIndex == -1' failed.
+error: Cannot build '/nix/store/…-PowerShell-7.0.0.drv'.
+       Reason: builder failed with exit code 134.
+VERDICT eddie: INCOMPLETE (a side was not built)
+VERDICT eddie emudhra: INCOMPLETE (a side was not built)
+```
+
+The breakage is in nixpkgs at the base, and the fix does not touch it. eddie is a GUI (`eddie-ui`), so
+there is no live shim. The run took 2:48; free space dropped by about 6 GB (the nupkg and mono fetches, and the
+failed builds, whose build dirs nix removed).
