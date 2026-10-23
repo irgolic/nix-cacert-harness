@@ -2335,3 +2335,36 @@ VERDICT julia live: PASS: before CONNECTED to 2/4 host(s) serving a compromised 
   - After refused all four: `unable to get local issuer certificate` for G3, and `certificate rejected (28)` for
     AAA, the e-mail-only trust rule in `ca-bundle.crt`.
   - The before side is the cached julia-1.13.2, so this also extends the julia-bin result to the from-source attribute.
+
+## Round 4: renpy, gnustep-base, pgsql-tools, wassima, autopsy (2026-10-23, worktree)
+
+Runs against the shared worktree (`after: worktree`), before the fixes were committed. Outputs:
+`runs/emudhra-<attr>.txt`.
+
+### renpy: static FIXED, eMudhra FIXED (7/14 → 0/14), live PASS through the SDK's bundled interpreter
+
+The fix: `postInstall` (only when the upstream SDK libraries are copied in, the default) replaces
+`share/renpy/lib/python3.12/certifi/cacert.pem` with a symlink to cacert's `ca-bundle.crt`. The `cp -ar` from
+the SDK store path leaves the directory read-only, so it does `chmod u+w` on `certifi/` first. The after side
+built in 2:54 (nixb, 4 cores); the base is on cache.nixos.org.
+
+- `bin/renpy` runs the engine on nixpkgs' `python312` with nixpkgs' `requests`/`certifi`, so it never reads
+  this file. The file belongs to the SDK's bundled interpreter, `lib/py3-linux-x86_64/python` (Python 3.12.8,
+  OpenSSL 3.3.2, `sys.path` = `lib/python3.12`), which the launcher's "Build Distributions" copies into every
+  game it packages (tar with `dereference = True`, zip and `shutil.copy` all follow the symlink).
+  `renpy.fetch()` and the updater use `requests` there.
+- `shims/live/renpy.nix` runs that interpreter through nixpkgs' dynamic loader (it needs only glibc and
+  libgcc_s) and does one `requests.get`, i.e. what a distributed game does. Its compiled-in OpenSSL default
+  paths point into the upstream build tree, so the host's `/etc/ssl` is not involved.
+
+```
+$ nix run github:irgolic/nix-cacert-harness -- renpy --base 8915027df75d0403ef013dd0cbf09ff3c602fd03 --emudhra
+| out:/share/renpy/lib/python3.12/certifi/cacert.pem | pem 120 certs: 5 not in cacert, 1 in cacert but not for TLS, 4 cacert TLS roots missing; scanner: ECC G3 | symlink->cacert:ca-bundle.crt pem 169 certs (118 TLS roots + 51 non-TLS, i.e. cacert's own trust-rules bundle) |
+VERDICT renpy: FIXED: before trusted CAs outside cacert; after: 1 store(s) == cacert, none with extra CAs
+| out:/share/renpy/lib/python3.12/certifi/cacert.pem | pem: accepted 7/14 (g3: 7/7, aaa: 0/7, noct: 1/2) | symlink->cacert:ca-bundle.crt pem: accepted 0/14 |
+VERDICT renpy emudhra: FIXED: before accepted 7/14 compromised eMudhra chains (g3: 7/7, aaa: 0/7, noct: 1/2); after 0/14
+         | dv-g3b         | dv-g3b-aaa     | dv-g3c         | dv-g3c-aaa
+before   | CONNECTED      | REFUSED        | CONNECTED      | REFUSED
+after    | REFUSED        | REFUSED        | REFUSED        | REFUSED
+VERDICT renpy live: PASS: before CONNECTED to 2/4 host(s) serving a compromised eMudhra chain (dv-g3b,dv-g3c); after REFUSED on all 4
+```
